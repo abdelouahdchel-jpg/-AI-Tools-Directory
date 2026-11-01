@@ -1,0 +1,6 @@
+{
+  "name": "AI Tools Directory",
+  "description": "Production-grade AI software directory for discovering, comparing, and managing verified AI tools and services.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
