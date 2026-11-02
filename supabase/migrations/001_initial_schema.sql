@@ -238,73 +238,201 @@ CREATE TABLE IF NOT EXISTS submissions (
 
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
 
--- 15. ROW LEVEL SECURITY (RLS) POLICIES
-ALTER TABLE tools ENABLE ROW LEVEL SECURITY;
-ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tool_categories ENABLE ROW LEVEL SECURITY;
-ALTER TABLE pricing_plans ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tool_features ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tool_alternatives ENABLE ROW LEVEL SECURITY;
-ALTER TABLE submissions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE import_batches ENABLE ROW LEVEL SECURITY;
-ALTER TABLE import_errors ENABLE ROW LEVEL SECURITY;
 
--- Public can only view published tools
-CREATE POLICY "Public read access to published tools"
-    ON tools FOR SELECT
-    USING (publication_status = 'published');
+
+-- 15. ROW LEVEL SECURITY (RLS) POLICIES
+
+-- Enable RLS on all protected tables
+ALTER TABLE public.tools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tool_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.pricing_plans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tool_features ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tool_alternatives ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliate_programs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.submissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.import_batches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.import_errors ENABLE ROW LEVEL SECURITY;
+
+-- Admin verification functions
+CREATE OR REPLACE FUNCTION public.is_active_admin()
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.admin_users
+        WHERE id = (SELECT auth.uid())
+          AND is_active = true
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_super_admin()
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.admin_users
+        WHERE id = (SELECT auth.uid())
+          AND is_active = true
+          AND role = 'super_admin'
+    );
+$$;
+
+-- Remove old policies before creating the new ones
+DROP POLICY IF EXISTS "Public read access to published tools" ON public.tools;
+DROP POLICY IF EXISTS "Public read access to categories" ON public.categories;
+DROP POLICY IF EXISTS "Public read access to tool_categories" ON public.tool_categories;
+DROP POLICY IF EXISTS "Public read access to pricing_plans" ON public.pricing_plans;
+DROP POLICY IF EXISTS "Public read access to tool_features" ON public.tool_features;
+DROP POLICY IF EXISTS "Public can submit tools" ON public.submissions;
+DROP POLICY IF EXISTS "Admin full access to tools" ON public.tools;
+
+-- Public can only read published tools
+CREATE POLICY "Public read published tools"
+ON public.tools FOR SELECT TO anon, authenticated
+USING (publication_status = 'published');
 
 -- Public can read categories
-CREATE POLICY "Public read access to categories"
-    ON categories FOR SELECT
-    USING (true);
+CREATE POLICY "Public read categories"
+ON public.categories FOR SELECT TO anon, authenticated
+USING (true);
 
--- Public can read tool_categories for published tools
-CREATE POLICY "Public read access to tool_categories"
-    ON tool_categories FOR SELECT
-    USING (
-        EXISTS (
-            SELECT 1 FROM tools
-            WHERE tools.id = tool_categories.tool_id
-            AND tools.publication_status = 'published'
-        )
-    );
+-- Public can read categories linked to published tools
+CREATE POLICY "Public read published tool categories"
+ON public.tool_categories FOR SELECT TO anon, authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.tools t
+        WHERE t.id = tool_categories.tool_id
+          AND t.publication_status = 'published'
+    )
+);
 
 -- Public can read pricing plans for published tools
-CREATE POLICY "Public read access to pricing_plans"
-    ON pricing_plans FOR SELECT
-    USING (
-        EXISTS (
-            SELECT 1 FROM tools
-            WHERE tools.id = pricing_plans.tool_id
-            AND tools.publication_status = 'published'
-        )
-    );
+CREATE POLICY "Public read published pricing plans"
+ON public.pricing_plans FOR SELECT TO anon, authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.tools t
+        WHERE t.id = pricing_plans.tool_id
+          AND t.publication_status = 'published'
+    )
+);
 
 -- Public can read features for published tools
-CREATE POLICY "Public read access to tool_features"
-    ON tool_features FOR SELECT
-    USING (
-        EXISTS (
-            SELECT 1 FROM tools
-            WHERE tools.id = tool_features.tool_id
-            AND tools.publication_status = 'published'
-        )
-    );
+CREATE POLICY "Public read published tool features"
+ON public.tool_features FOR SELECT TO anon, authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.tools t
+        WHERE t.id = tool_features.tool_id
+          AND t.publication_status = 'published'
+    )
+);
 
--- Public can submit new tools (INSERT only, cannot read or modify existing)
-CREATE POLICY "Public can submit tools"
-    ON submissions FOR INSERT
-    WITH CHECK (true);
+-- Public can read alternatives only for published tools
+CREATE POLICY "Public read published tool alternatives"
+ON public.tool_alternatives FOR SELECT TO anon, authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.tools t
+        WHERE t.id = tool_alternatives.tool_id
+          AND t.publication_status = 'published'
+    )
+);
 
--- Admins full access (checked via admin_users table role)
-CREATE POLICY "Admin full access to tools"
-    ON tools FOR ALL
-    USING (
-        EXISTS (
-            SELECT 1 FROM admin_users
-            WHERE admin_users.id = auth.uid()
-            AND admin_users.is_active = true
-        )
-    );
+-- Public submissions: INSERT only
+CREATE POLICY "Public submit tools"
+ON public.submissions FOR INSERT TO anon, authenticated
+WITH CHECK (true);
+
+-- Admin management policies
+CREATE POLICY "Admins manage tools"
+ON public.tools FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage categories"
+ON public.categories FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage tool categories"
+ON public.tool_categories FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage pricing plans"
+ON public.pricing_plans FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage tool features"
+ON public.tool_features FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage tool alternatives"
+ON public.tool_alternatives FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage affiliate programs"
+ON public.affiliate_programs FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage submissions"
+ON public.submissions FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage import batches"
+ON public.import_batches FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins manage import errors"
+ON public.import_errors FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+-- Admin users can read their own record
+CREATE POLICY "Admins read own account"
+ON public.admin_users FOR SELECT TO authenticated
+USING (id = (SELECT auth.uid()));
+
+-- Only super admins can manage admin accounts
+CREATE POLICY "Super admins manage admin accounts"
+ON public.admin_users FOR ALL TO authenticated
+USING ((SELECT public.is_super_admin()))
+WITH CHECK ((SELECT public.is_super_admin()));
+
+-- Admins can read audit logs
+CREATE POLICY "Admins read audit logs"
+ON public.audit_logs FOR SELECT TO authenticated
+USING ((SELECT public.is_active_admin()));
+
+-- Admins can insert their own audit log entries
+CREATE POLICY "Admins insert own audit logs"
+ON public.audit_logs FOR INSERT TO authenticated
+WITH CHECK (
+    administrator_id = (SELECT auth.uid())
+    AND (SELECT public.is_active_admin())
+);
+
+-- Restrict function execution to authenticated users
+REVOKE ALL ON FUNCTION public.is_active_admin() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.is_super_admin() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_active_admin() TO authenticated;
+GRANT EXECUTE ON FUNCTION public.is_super_admin() TO authenticated;
