@@ -33,24 +33,42 @@ EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
 
--- 3. CATEGORIES TABLE (Hierarchical)
-CREATE TABLE IF NOT EXISTS categories (
+-- 3. UPDATED_AT TRIGGER FUNCTION
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+-- 4. CATEGORIES TABLE (Hierarchical)
+CREATE TABLE IF NOT EXISTS public.categories (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(100) NOT NULL,
     slug VARCHAR(120) NOT NULL UNIQUE,
     description TEXT,
-    parent_id UUID REFERENCES categories(id) ON DELETE SET NULL,
+    parent_id UUID REFERENCES public.categories(id) ON DELETE SET NULL,
     icon_name VARCHAR(50) DEFAULT 'Sparkles',
     display_order INT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_categories_slug ON categories(slug);
-CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
+CREATE INDEX IF NOT EXISTS idx_categories_slug ON public.categories(slug);
+CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON public.categories(parent_id);
+CREATE INDEX IF NOT EXISTS idx_categories_display_order ON public.categories(display_order);
 
--- 4. TOOLS TABLE (Primary Entity)
-CREATE TABLE IF NOT EXISTS tools (
+DROP TRIGGER IF EXISTS trg_categories_updated_at ON public.categories;
+CREATE TRIGGER trg_categories_updated_at
+    BEFORE UPDATE ON public.categories
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- 5. TOOLS TABLE (Primary Entity)
+CREATE TABLE IF NOT EXISTS public.tools (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(150) NOT NULL,
     slug VARCHAR(180) NOT NULL UNIQUE,
@@ -60,7 +78,7 @@ CREATE TABLE IF NOT EXISTS tools (
     full_description TEXT NOT NULL,
     logo_url TEXT,
     pricing_type pricing_type_enum NOT NULL DEFAULT 'unknown',
-    starting_price NUMERIC(10, 2) DEFAULT 0.00,
+    starting_price NUMERIC(10, 2) DEFAULT NULL CHECK (starting_price IS NULL OR starting_price >= 0.00),
     currency VARCHAR(10) DEFAULT 'USD',
     affiliate_url TEXT,
     official_source_url TEXT,
@@ -81,16 +99,25 @@ CREATE TABLE IF NOT EXISTS tools (
 );
 
 -- Indexes for performance & scaling
-CREATE INDEX IF NOT EXISTS idx_tools_slug ON tools(slug);
-CREATE INDEX IF NOT EXISTS idx_tools_domain ON tools(normalized_domain);
-CREATE INDEX IF NOT EXISTS idx_tools_publication_status ON tools(publication_status);
-CREATE INDEX IF NOT EXISTS idx_tools_featured ON tools(featured) WHERE publication_status = 'published';
-CREATE INDEX IF NOT EXISTS idx_tools_pricing_type ON tools(pricing_type);
-CREATE INDEX IF NOT EXISTS idx_tools_created_at ON tools(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_tools_search ON tools USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_tools_slug ON public.tools(slug);
+CREATE INDEX IF NOT EXISTS idx_tools_domain ON public.tools(normalized_domain);
+CREATE INDEX IF NOT EXISTS idx_tools_publication_status ON public.tools(publication_status);
+CREATE INDEX IF NOT EXISTS idx_tools_featured ON public.tools(featured) WHERE publication_status = 'published';
+CREATE INDEX IF NOT EXISTS idx_tools_pricing_type ON public.tools(pricing_type);
+CREATE INDEX IF NOT EXISTS idx_tools_created_at ON public.tools(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tools_search ON public.tools USING GIN(search_vector);
+
+DROP TRIGGER IF EXISTS trg_tools_updated_at ON public.tools;
+CREATE TRIGGER trg_tools_updated_at
+    BEFORE UPDATE ON public.tools
+    FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 -- Full-text search trigger
-CREATE OR REPLACE FUNCTION update_tool_search_vector() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.update_tool_search_vector()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
 BEGIN
     NEW.search_vector :=
         setweight(to_tsvector('english', coalesce(NEW.name, '')), 'A') ||
@@ -98,29 +125,30 @@ BEGIN
         setweight(to_tsvector('english', coalesce(NEW.full_description, '')), 'C');
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
-DROP TRIGGER IF EXISTS trg_tool_search_vector ON tools;
+DROP TRIGGER IF EXISTS trg_tool_search_vector ON public.tools;
 CREATE TRIGGER trg_tool_search_vector
-    BEFORE INSERT OR UPDATE ON tools
-    FOR EACH ROW EXECUTE FUNCTION update_tool_search_vector();
+    BEFORE INSERT OR UPDATE ON public.tools
+    FOR EACH ROW EXECUTE FUNCTION public.update_tool_search_vector();
 
--- 5. TOOL_CATEGORIES (Many-to-Many)
-CREATE TABLE IF NOT EXISTS tool_categories (
-    tool_id UUID NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
-    category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+-- 6. TOOL_CATEGORIES (Many-to-Many)
+CREATE TABLE IF NOT EXISTS public.tool_categories (
+    tool_id UUID NOT NULL REFERENCES public.tools(id) ON DELETE CASCADE,
+    category_id UUID NOT NULL REFERENCES public.categories(id) ON DELETE CASCADE,
     is_primary BOOLEAN DEFAULT FALSE,
     PRIMARY KEY (tool_id, category_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tool_categories_cat ON tool_categories(category_id);
+CREATE INDEX IF NOT EXISTS idx_tool_categories_cat ON public.tool_categories(category_id);
+CREATE INDEX IF NOT EXISTS idx_tool_categories_tool ON public.tool_categories(tool_id);
 
--- 6. PRICING PLANS
-CREATE TABLE IF NOT EXISTS pricing_plans (
+-- 7. PRICING PLANS
+CREATE TABLE IF NOT EXISTS public.pricing_plans (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tool_id UUID NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+    tool_id UUID NOT NULL REFERENCES public.tools(id) ON DELETE CASCADE,
     plan_name VARCHAR(100) NOT NULL,
-    price NUMERIC(10, 2) DEFAULT 0.00,
+    price NUMERIC(10, 2) DEFAULT 0.00 CHECK (price >= 0.00),
     billing_period VARCHAR(30) DEFAULT 'monthly', -- 'monthly', 'annually', 'one_time', 'usage_based'
     currency VARCHAR(10) DEFAULT 'USD',
     description TEXT,
@@ -130,31 +158,35 @@ CREATE TABLE IF NOT EXISTS pricing_plans (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_pricing_plans_tool_id ON pricing_plans(tool_id);
+CREATE INDEX IF NOT EXISTS idx_pricing_plans_tool_id ON public.pricing_plans(tool_id);
 
--- 7. TOOL FEATURES
-CREATE TABLE IF NOT EXISTS tool_features (
+-- 8. TOOL FEATURES
+CREATE TABLE IF NOT EXISTS public.tool_features (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tool_id UUID NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+    tool_id UUID NOT NULL REFERENCES public.tools(id) ON DELETE CASCADE,
     feature_name VARCHAR(120) NOT NULL,
     description TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_tool_features_tool_id ON tool_features(tool_id);
+CREATE INDEX IF NOT EXISTS idx_tool_features_tool_id ON public.tool_features(tool_id);
 
--- 8. TOOL ALTERNATIVES
-CREATE TABLE IF NOT EXISTS tool_alternatives (
-    tool_id UUID NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
-    alternative_tool_id UUID NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
-    similarity_score NUMERIC(3, 2) DEFAULT 0.80,
-    PRIMARY KEY (tool_id, alternative_tool_id)
+-- 9. TOOL ALTERNATIVES
+CREATE TABLE IF NOT EXISTS public.tool_alternatives (
+    tool_id UUID NOT NULL REFERENCES public.tools(id) ON DELETE CASCADE,
+    alternative_tool_id UUID NOT NULL REFERENCES public.tools(id) ON DELETE CASCADE,
+    similarity_score NUMERIC(3, 2) DEFAULT 0.80 CHECK (similarity_score >= 0.00 AND similarity_score <= 1.00),
+    PRIMARY KEY (tool_id, alternative_tool_id),
+    CONSTRAINT chk_tool_not_self_alternative CHECK (tool_id <> alternative_tool_id)
 );
 
--- 9. AFFILIATE PROGRAMS
-CREATE TABLE IF NOT EXISTS affiliate_programs (
+CREATE INDEX IF NOT EXISTS idx_tool_alternatives_tool_id ON public.tool_alternatives(tool_id);
+CREATE INDEX IF NOT EXISTS idx_tool_alternatives_alt_id ON public.tool_alternatives(alternative_tool_id);
+
+-- 10. AFFILIATE PROGRAMS (Private commercial data)
+CREATE TABLE IF NOT EXISTS public.affiliate_programs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tool_id UUID NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+    tool_id UUID NOT NULL REFERENCES public.tools(id) ON DELETE CASCADE,
     affiliate_network VARCHAR(100),
     application_url TEXT,
     commission_details TEXT,
@@ -164,8 +196,10 @@ CREATE TABLE IF NOT EXISTS affiliate_programs (
     last_updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 10. IMPORT BATCHES
-CREATE TABLE IF NOT EXISTS import_batches (
+CREATE INDEX IF NOT EXISTS idx_affiliate_programs_tool_id ON public.affiliate_programs(tool_id);
+
+-- 11. IMPORT BATCHES
+CREATE TABLE IF NOT EXISTS public.import_batches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     filename VARCHAR(255) NOT NULL,
     source_name VARCHAR(120) NOT NULL,
@@ -182,10 +216,12 @@ CREATE TABLE IF NOT EXISTS import_batches (
     completed_at TIMESTAMPTZ
 );
 
--- 11. IMPORT ERRORS
-CREATE TABLE IF NOT EXISTS import_errors (
+CREATE INDEX IF NOT EXISTS idx_import_batches_created_at ON public.import_batches(created_at DESC);
+
+-- 12. IMPORT ERRORS
+CREATE TABLE IF NOT EXISTS public.import_errors (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    batch_id UUID NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL REFERENCES public.import_batches(id) ON DELETE CASCADE,
     row_number INT NOT NULL,
     error_code VARCHAR(80) NOT NULL,
     error_message TEXT NOT NULL,
@@ -193,23 +229,25 @@ CREATE TABLE IF NOT EXISTS import_errors (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_import_errors_batch ON import_errors(batch_id);
+CREATE INDEX IF NOT EXISTS idx_import_errors_batch ON public.import_errors(batch_id);
 
--- 12. ADMIN USERS (Identity bridge to Supabase Auth)
-CREATE TABLE IF NOT EXISTS admin_users (
-    id UUID PRIMARY KEY, -- matches auth.users.id
+-- 13. ADMIN USERS (Identity bridge to Supabase Auth)
+CREATE TABLE IF NOT EXISTS public.admin_users (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     email VARCHAR(255) NOT NULL UNIQUE,
     full_name VARCHAR(120),
-    role VARCHAR(50) NOT NULL DEFAULT 'editor', -- 'super_admin', 'editor', 'moderator'
+    role VARCHAR(50) NOT NULL DEFAULT 'editor' CHECK (role IN ('super_admin', 'editor', 'moderator')),
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     last_login_at TIMESTAMPTZ
 );
 
--- 13. AUDIT LOGS
-CREATE TABLE IF NOT EXISTS audit_logs (
+CREATE INDEX IF NOT EXISTS idx_admin_users_role_active ON public.admin_users(role, is_active);
+
+-- 14. AUDIT LOGS
+CREATE TABLE IF NOT EXISTS public.audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    administrator_id UUID,
+    administrator_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
     administrator_email VARCHAR(255),
     action VARCHAR(100) NOT NULL,
     entity_type VARCHAR(60) NOT NULL,
@@ -219,10 +257,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON public.audit_logs(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_admin_id ON public.audit_logs(administrator_id);
 
--- 14. SUBMISSIONS (Community submissions)
-CREATE TABLE IF NOT EXISTS submissions (
+-- 15. SUBMISSIONS (Community submissions)
+CREATE TABLE IF NOT EXISTS public.submissions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tool_name VARCHAR(150) NOT NULL,
     website_url TEXT NOT NULL,
@@ -236,11 +275,13 @@ CREATE TABLE IF NOT EXISTS submissions (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
+CREATE INDEX IF NOT EXISTS idx_submissions_status ON public.submissions(status);
+CREATE INDEX IF NOT EXISTS idx_submissions_created_at ON public.submissions(created_at DESC);
 
-
-
--- 15. ROW LEVEL SECURITY (RLS) POLICIES
+-- ====================================================================
+-- 16. ROW LEVEL SECURITY (RLS) POLICIES
+-- Preserves GitHub Section 15 architecture and adds security hardening
+-- ====================================================================
 
 -- Enable RLS on all protected tables
 ALTER TABLE public.tools ENABLE ROW LEVEL SECURITY;
@@ -256,7 +297,7 @@ ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.import_batches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.import_errors ENABLE ROW LEVEL SECURITY;
 
--- Admin verification functions
+-- Admin verification functions (GitHub section 15 implementation with search_path safety)
 CREATE OR REPLACE FUNCTION public.is_active_admin()
 RETURNS BOOLEAN
 LANGUAGE SQL
@@ -288,26 +329,85 @@ AS $$
     );
 $$;
 
--- Remove old policies before creating the new ones
+-- Remove old policies safely before creating the verified policies
 DROP POLICY IF EXISTS "Public read access to published tools" ON public.tools;
-DROP POLICY IF EXISTS "Public read access to categories" ON public.categories;
-DROP POLICY IF EXISTS "Public read access to tool_categories" ON public.tool_categories;
-DROP POLICY IF EXISTS "Public read access to pricing_plans" ON public.pricing_plans;
-DROP POLICY IF EXISTS "Public read access to tool_features" ON public.tool_features;
-DROP POLICY IF EXISTS "Public can submit tools" ON public.submissions;
+DROP POLICY IF EXISTS "Public read published tools" ON public.tools;
+DROP POLICY IF EXISTS "Admins manage tools" ON public.tools;
 DROP POLICY IF EXISTS "Admin full access to tools" ON public.tools;
 
--- Public can only read published tools
+DROP POLICY IF EXISTS "Public read access to categories" ON public.categories;
+DROP POLICY IF EXISTS "Public read categories" ON public.categories;
+DROP POLICY IF EXISTS "Admins manage categories" ON public.categories;
+DROP POLICY IF EXISTS "Admin manage categories" ON public.categories;
+
+DROP POLICY IF EXISTS "Public read access to tool_categories" ON public.tool_categories;
+DROP POLICY IF EXISTS "Public read published tool categories" ON public.tool_categories;
+DROP POLICY IF EXISTS "Admins manage tool categories" ON public.tool_categories;
+DROP POLICY IF EXISTS "Admin manage tool_categories" ON public.tool_categories;
+
+DROP POLICY IF EXISTS "Public read access to pricing_plans" ON public.pricing_plans;
+DROP POLICY IF EXISTS "Public read published pricing plans" ON public.pricing_plans;
+DROP POLICY IF EXISTS "Admins manage pricing plans" ON public.pricing_plans;
+DROP POLICY IF EXISTS "Admin manage pricing_plans" ON public.pricing_plans;
+
+DROP POLICY IF EXISTS "Public read access to tool_features" ON public.tool_features;
+DROP POLICY IF EXISTS "Public read published tool features" ON public.tool_features;
+DROP POLICY IF EXISTS "Admins manage tool features" ON public.tool_features;
+DROP POLICY IF EXISTS "Admin manage tool_features" ON public.tool_features;
+
+DROP POLICY IF EXISTS "Public read access to tool_alternatives" ON public.tool_alternatives;
+DROP POLICY IF EXISTS "Public read published tool alternatives" ON public.tool_alternatives;
+DROP POLICY IF EXISTS "Admins manage tool alternatives" ON public.tool_alternatives;
+DROP POLICY IF EXISTS "Admin manage tool_alternatives" ON public.tool_alternatives;
+
+DROP POLICY IF EXISTS "Admins manage affiliate programs" ON public.affiliate_programs;
+DROP POLICY IF EXISTS "Admin manage affiliate_programs" ON public.affiliate_programs;
+
+DROP POLICY IF EXISTS "Public can submit tools" ON public.submissions;
+DROP POLICY IF EXISTS "Public submit tools" ON public.submissions;
+DROP POLICY IF EXISTS "Admins manage submissions" ON public.submissions;
+DROP POLICY IF EXISTS "Admin manage submissions" ON public.submissions;
+
+DROP POLICY IF EXISTS "Admins read own account" ON public.admin_users;
+DROP POLICY IF EXISTS "Super admins manage admin accounts" ON public.admin_users;
+DROP POLICY IF EXISTS "Super admins view all admin accounts" ON public.admin_users;
+
+DROP POLICY IF EXISTS "Admins read audit logs" ON public.audit_logs;
+DROP POLICY IF EXISTS "Admins insert own audit logs" ON public.audit_logs;
+
+DROP POLICY IF EXISTS "Admins manage import batches" ON public.import_batches;
+DROP POLICY IF EXISTS "Admin manage import_batches" ON public.import_batches;
+
+DROP POLICY IF EXISTS "Admins manage import errors" ON public.import_errors;
+DROP POLICY IF EXISTS "Admin manage import_errors" ON public.import_errors;
+
+-- --------------------------------------------------------------------
+-- A. TOOLS POLICIES
+-- --------------------------------------------------------------------
 CREATE POLICY "Public read published tools"
 ON public.tools FOR SELECT TO anon, authenticated
 USING (publication_status = 'published');
 
--- Public can read categories
+CREATE POLICY "Admins manage tools"
+ON public.tools FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+-- --------------------------------------------------------------------
+-- B. CATEGORIES POLICIES
+-- --------------------------------------------------------------------
 CREATE POLICY "Public read categories"
 ON public.categories FOR SELECT TO anon, authenticated
 USING (true);
 
--- Public can read categories linked to published tools
+CREATE POLICY "Admins manage categories"
+ON public.categories FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+-- --------------------------------------------------------------------
+-- C. TOOL_CATEGORIES POLICIES
+-- --------------------------------------------------------------------
 CREATE POLICY "Public read published tool categories"
 ON public.tool_categories FOR SELECT TO anon, authenticated
 USING (
@@ -318,7 +418,14 @@ USING (
     )
 );
 
--- Public can read pricing plans for published tools
+CREATE POLICY "Admins manage tool categories"
+ON public.tool_categories FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+-- --------------------------------------------------------------------
+-- D. PRICING_PLANS POLICIES
+-- --------------------------------------------------------------------
 CREATE POLICY "Public read published pricing plans"
 ON public.pricing_plans FOR SELECT TO anon, authenticated
 USING (
@@ -329,7 +436,14 @@ USING (
     )
 );
 
--- Public can read features for published tools
+CREATE POLICY "Admins manage pricing plans"
+ON public.pricing_plans FOR ALL TO authenticated
+USING ((SELECT public.is_active_admin()))
+WITH CHECK ((SELECT public.is_active_admin()));
+
+-- --------------------------------------------------------------------
+-- E. TOOL_FEATURES POLICIES
+-- --------------------------------------------------------------------
 CREATE POLICY "Public read published tool features"
 ON public.tool_features FOR SELECT TO anon, authenticated
 USING (
@@ -340,63 +454,75 @@ USING (
     )
 );
 
--- Public can read alternatives only for published tools
-CREATE POLICY "Public read published tool alternatives"
-ON public.tool_alternatives FOR SELECT TO anon, authenticated
-USING (
-    EXISTS (
-        SELECT 1 FROM public.tools t
-        WHERE t.id = tool_alternatives.tool_id
-          AND t.publication_status = 'published'
-    )
-);
-
--- Public submissions: INSERT only
-CREATE POLICY "Public submit tools"
-ON public.submissions FOR INSERT TO anon, authenticated
-WITH CHECK (true);
-
--- Admin management policies
-CREATE POLICY "Admins manage tools"
-ON public.tools FOR ALL TO authenticated
-USING ((SELECT public.is_active_admin()))
-WITH CHECK ((SELECT public.is_active_admin()));
-
-CREATE POLICY "Admins manage categories"
-ON public.categories FOR ALL TO authenticated
-USING ((SELECT public.is_active_admin()))
-WITH CHECK ((SELECT public.is_active_admin()));
-
-CREATE POLICY "Admins manage tool categories"
-ON public.tool_categories FOR ALL TO authenticated
-USING ((SELECT public.is_active_admin()))
-WITH CHECK ((SELECT public.is_active_admin()));
-
-CREATE POLICY "Admins manage pricing plans"
-ON public.pricing_plans FOR ALL TO authenticated
-USING ((SELECT public.is_active_admin()))
-WITH CHECK ((SELECT public.is_active_admin()));
-
 CREATE POLICY "Admins manage tool features"
 ON public.tool_features FOR ALL TO authenticated
 USING ((SELECT public.is_active_admin()))
 WITH CHECK ((SELECT public.is_active_admin()));
+
+-- --------------------------------------------------------------------
+-- F. TOOL_ALTERNATIVES POLICIES
+-- Verified: Both primary tool AND alternative tool must be published
+-- --------------------------------------------------------------------
+CREATE POLICY "Public read published tool alternatives"
+ON public.tool_alternatives FOR SELECT TO anon, authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.tools t1
+        WHERE t1.id = tool_alternatives.tool_id
+          AND t1.publication_status = 'published'
+    )
+    AND EXISTS (
+        SELECT 1 FROM public.tools t2
+        WHERE t2.id = tool_alternatives.alternative_tool_id
+          AND t2.publication_status = 'published'
+    )
+);
 
 CREATE POLICY "Admins manage tool alternatives"
 ON public.tool_alternatives FOR ALL TO authenticated
 USING ((SELECT public.is_active_admin()))
 WITH CHECK ((SELECT public.is_active_admin()));
 
+-- --------------------------------------------------------------------
+-- G. AFFILIATE_PROGRAMS POLICIES
+-- Private commercial data: Zero public access
+-- --------------------------------------------------------------------
 CREATE POLICY "Admins manage affiliate programs"
 ON public.affiliate_programs FOR ALL TO authenticated
 USING ((SELECT public.is_active_admin()))
 WITH CHECK ((SELECT public.is_active_admin()));
+
+-- --------------------------------------------------------------------
+-- H. SUBMISSIONS POLICIES
+-- Public: INSERT only (cannot read, edit, or delete)
+-- --------------------------------------------------------------------
+CREATE POLICY "Public submit tools"
+ON public.submissions FOR INSERT TO anon, authenticated
+WITH CHECK (true);
 
 CREATE POLICY "Admins manage submissions"
 ON public.submissions FOR ALL TO authenticated
 USING ((SELECT public.is_active_admin()))
 WITH CHECK ((SELECT public.is_active_admin()));
 
+-- --------------------------------------------------------------------
+-- I. AUDIT_LOGS POLICIES
+-- Append-only for active admins; readable only by active admins
+-- --------------------------------------------------------------------
+CREATE POLICY "Admins read audit logs"
+ON public.audit_logs FOR SELECT TO authenticated
+USING ((SELECT public.is_active_admin()));
+
+CREATE POLICY "Admins insert own audit logs"
+ON public.audit_logs FOR INSERT TO authenticated
+WITH CHECK (
+    administrator_id = (SELECT auth.uid())
+    AND (SELECT public.is_active_admin())
+);
+
+-- --------------------------------------------------------------------
+-- J. IMPORT_BATCHES & IMPORT_ERRORS POLICIES
+-- --------------------------------------------------------------------
 CREATE POLICY "Admins manage import batches"
 ON public.import_batches FOR ALL TO authenticated
 USING ((SELECT public.is_active_admin()))
@@ -407,32 +533,42 @@ ON public.import_errors FOR ALL TO authenticated
 USING ((SELECT public.is_active_admin()))
 WITH CHECK ((SELECT public.is_active_admin()));
 
--- Admin users can read their own record
+-- --------------------------------------------------------------------
+-- K. ADMIN_USERS POLICIES
+-- Non-recursive: Admins read own record, super_admins manage all
+-- --------------------------------------------------------------------
 CREATE POLICY "Admins read own account"
 ON public.admin_users FOR SELECT TO authenticated
 USING (id = (SELECT auth.uid()));
 
--- Only super admins can manage admin accounts
 CREATE POLICY "Super admins manage admin accounts"
 ON public.admin_users FOR ALL TO authenticated
 USING ((SELECT public.is_super_admin()))
 WITH CHECK ((SELECT public.is_super_admin()));
 
--- Admins can read audit logs
-CREATE POLICY "Admins read audit logs"
-ON public.audit_logs FOR SELECT TO authenticated
-USING ((SELECT public.is_active_admin()));
+-- ====================================================================
+-- 17. POSTGRESQL ROLE GRANTS & PERMISSIONS
+-- Defense in depth: Policies define row visibility, grants control command access
+-- ====================================================================
 
--- Admins can insert their own audit log entries
-CREATE POLICY "Admins insert own audit logs"
-ON public.audit_logs FOR INSERT TO authenticated
-WITH CHECK (
-    administrator_id = (SELECT auth.uid())
-    AND (SELECT public.is_active_admin())
-);
-
--- Restrict function execution to authenticated users
+-- Restrict function execution strictly to authenticated callers and service_role
 REVOKE ALL ON FUNCTION public.is_active_admin() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.is_super_admin() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.is_active_admin() TO authenticated;
-GRANT EXECUTE ON FUNCTION public.is_super_admin() TO authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_admin() TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.is_super_admin() TO authenticated, service_role;
+
+-- Revoke broad default permissions on public schema
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC, anon;
+
+-- Grant service_role full administrative access (used by server-side workers)
+GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
+
+-- Grant anon role read-only to public directory endpoints and insert-only on submissions
+GRANT SELECT ON public.tools, public.categories, public.tool_categories, public.pricing_plans, public.tool_features, public.tool_alternatives TO anon;
+GRANT INSERT ON public.submissions TO anon;
+
+-- Grant authenticated role permissions constrained by RLS policies
+GRANT SELECT ON public.tools, public.categories, public.tool_categories, public.pricing_plans, public.tool_features, public.tool_alternatives TO authenticated;
+GRANT INSERT ON public.submissions TO authenticated;
+GRANT ALL ON public.tools, public.categories, public.tool_categories, public.pricing_plans, public.tool_features, public.tool_alternatives, public.affiliate_programs, public.admin_users, public.submissions, public.audit_logs, public.import_batches, public.import_errors TO authenticated;
