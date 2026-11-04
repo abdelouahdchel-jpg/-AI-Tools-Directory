@@ -1,0 +1,20 @@
+-- Bootstrap the first Super Admin
+INSERT INTO public.admin_users (
+    id,
+    email,
+    full_name,
+    role,
+    is_active
+)
+SELECT
+    id,
+    email,
+    'Directory Administrator',
+    'super_admin',
+    TRUE
+FROM auth.users
+WHERE id = '853fd65e-ec06-450c-bb51-856a6fa90305'
+ON CONFLICT (id) DO UPDATE
+SET
+    role = 'super_admin',
+    is_active = TRUE;
