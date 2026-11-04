@@ -18,7 +18,14 @@ import {
   RefreshCw,
   Download,
   Search,
-  ExternalLink
+  ExternalLink,
+  Key,
+  Settings,
+  ShieldAlert,
+  Check,
+  Loader2,
+  Info,
+  Crown
 } from 'lucide-react';
 import {
   Tool,
@@ -35,19 +42,55 @@ import { INITIAL_CATEGORIES } from '../data/initialData';
 import { directoryStorage } from '../services/storage';
 import { normalizeDomain, generateSlug } from '../lib/validation';
 import { ToolLogo } from './ToolLogo';
+import {
+  signInAdminWithSupabase,
+  getActiveAdminSession,
+  signOutAdmin,
+  isSupabaseConfigured,
+  getSupabaseConfig,
+  saveSupabaseConfig,
+  clearSupabaseConfig,
+  sendPasswordReset,
+  AdminProfile
+} from '../lib/supabase';
 
 interface AdminDashboardProps {
   onBackToSite: () => void;
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) => {
-  // Authentication state (Session simulation adhering to admin role requirements)
-  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+  // Supabase Authentication & Admin Authorization state
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     return sessionStorage.getItem('admin_authenticated') === 'true';
   });
+  const [adminProfile, setAdminProfile] = useState<AdminProfile | null>(() => {
+    const savedEmail = sessionStorage.getItem('admin_user');
+    const savedRole = sessionStorage.getItem('admin_role') as any;
+    if (savedEmail && savedRole) {
+      return {
+        id: sessionStorage.getItem('admin_uid') || 'cached-id',
+        email: savedEmail,
+        full_name: sessionStorage.getItem('admin_name') || 'Administrator',
+        role: savedRole,
+        is_active: true,
+        created_at: new Date().toISOString()
+      };
+    }
+    return null;
+  });
+
+  const [isCheckingSession, setIsCheckingSession] = useState(true);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [adminEmail, setAdminEmail] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
   const [authError, setAuthError] = useState('');
+  const [resetMessage, setResetMessage] = useState('');
+  const [showConfigModal, setShowConfigModal] = useState(false);
+
+  // Runtime Supabase configuration state
+  const [configUrl, setConfigUrl] = useState(() => getSupabaseConfig().url);
+  const [configAnonKey, setConfigAnonKey] = useState(() => getSupabaseConfig().anonKey);
+  const [configSavedNotice, setConfigSavedNotice] = useState(false);
 
   // Active Tab: overview | tools | bulk-import | submissions | categories | audit-logs
   const [activeTab, setActiveTab] = useState<'overview' | 'tools' | 'bulk-import' | 'submissions' | 'categories' | 'audit-logs'>('overview');
@@ -93,31 +136,158 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     setAuditLogs(directoryStorage.getAuditLogs());
   };
 
+  // Check active Supabase Auth session on component mount
+  useEffect(() => {
+    let isMounted = true;
+    async function verifySession() {
+      setIsCheckingSession(true);
+      try {
+        if (isSupabaseConfigured()) {
+          const authSession = await getActiveAdminSession();
+          if (authSession && isMounted) {
+            setAdminProfile(authSession.adminProfile);
+            setIsAuthenticated(true);
+            sessionStorage.setItem('admin_authenticated', 'true');
+            sessionStorage.setItem('admin_user', authSession.adminProfile.email);
+            sessionStorage.setItem('admin_uid', authSession.adminProfile.id);
+            sessionStorage.setItem('admin_role', authSession.adminProfile.role);
+            if (authSession.adminProfile.full_name) {
+              sessionStorage.setItem('admin_name', authSession.adminProfile.full_name);
+            }
+          }
+        }
+      } catch {
+        // Fallback to current state
+      } finally {
+        if (isMounted) setIsCheckingSession(false);
+      }
+    }
+
+    verifySession();
+    return () => { isMounted = false; };
+  }, []);
+
   useEffect(() => {
     if (isAuthenticated) {
       refreshData();
     }
   }, [isAuthenticated]);
 
-  // Handle Login
-  const handleLogin = (e: React.FormEvent) => {
+  // Handle Login via Supabase Auth
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
-    // In production, this verifies via Supabase Auth server session.
-    // Here we enforce administrator credential format.
-    if (adminEmail.includes('@') && adminPassword.length >= 6) {
-      sessionStorage.setItem('admin_authenticated', 'true');
-      sessionStorage.setItem('admin_user', adminEmail);
-      setIsAuthenticated(true);
-      directoryStorage.logAuditAction('admin_login', 'auth', adminEmail, { method: 'credential_auth' });
-    } else {
-      setAuthError('Invalid credentials. Password must be at least 6 characters.');
+    setResetMessage('');
+    setIsLoggingIn(true);
+
+    try {
+      if (isSupabaseConfigured()) {
+        // Authenticate with Supabase Auth and verify role in public.admin_users
+        const authSession = await signInAdminWithSupabase(adminEmail, adminPassword);
+        setAdminProfile(authSession.adminProfile);
+        setIsAuthenticated(true);
+        sessionStorage.setItem('admin_authenticated', 'true');
+        sessionStorage.setItem('admin_user', authSession.adminProfile.email);
+        sessionStorage.setItem('admin_uid', authSession.adminProfile.id);
+        sessionStorage.setItem('admin_role', authSession.adminProfile.role);
+        if (authSession.adminProfile.full_name) {
+          sessionStorage.setItem('admin_name', authSession.adminProfile.full_name);
+        }
+        directoryStorage.logAuditAction('admin_login', 'auth', authSession.adminProfile.email, {
+          method: 'supabase_auth',
+          uid: authSession.user.id,
+          role: authSession.adminProfile.role
+        });
+      } else {
+        // If Supabase credentials are not connected yet:
+        if (adminEmail.includes('@') && adminPassword.length >= 6) {
+          const fallbackProfile: AdminProfile = {
+            id: 'local-admin-sim',
+            email: adminEmail.trim().toLowerCase(),
+            full_name: 'Local Administrator',
+            role: 'super_admin',
+            is_active: true,
+            created_at: new Date().toISOString()
+          };
+          setAdminProfile(fallbackProfile);
+          setIsAuthenticated(true);
+          sessionStorage.setItem('admin_authenticated', 'true');
+          sessionStorage.setItem('admin_user', adminEmail);
+          sessionStorage.setItem('admin_uid', fallbackProfile.id);
+          sessionStorage.setItem('admin_role', 'super_admin');
+          directoryStorage.logAuditAction('admin_login', 'auth', adminEmail, { method: 'local_offline_auth' });
+        } else {
+          setAuthError('Invalid credentials. Password must be at least 6 characters.');
+        }
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Authentication failed. Please verify credentials.');
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
-  const handleLogout = () => {
+  // Handle Logout
+  const handleLogout = async () => {
+    try {
+      await signOutAdmin();
+    } catch {
+      // Ignore
+    }
     sessionStorage.removeItem('admin_authenticated');
+    sessionStorage.removeItem('admin_user');
+    sessionStorage.removeItem('admin_uid');
+    sessionStorage.removeItem('admin_role');
+    sessionStorage.removeItem('admin_name');
     setIsAuthenticated(false);
+    setAdminProfile(null);
+  };
+
+  // Handle Password Reset
+  const handlePasswordReset = async () => {
+    if (!adminEmail.includes('@')) {
+      setAuthError('Please enter your administrator email first.');
+      return;
+    }
+    setAuthError('');
+    setResetMessage('');
+    try {
+      if (isSupabaseConfigured()) {
+        await sendPasswordReset(adminEmail);
+        setResetMessage(`Password reset link sent to ${adminEmail}. Please check your inbox.`);
+      } else {
+        setAuthError('Supabase is not connected. Configure project credentials first.');
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to send password reset email.');
+    }
+  };
+
+  // Save runtime Supabase credentials
+  const handleSaveConfig = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!configUrl.trim().startsWith('http')) {
+      alert('Project URL must start with https://');
+      return;
+    }
+    if (configAnonKey.trim().length < 20) {
+      alert('Please enter a valid Supabase Anon Public Key.');
+      return;
+    }
+    saveSupabaseConfig(configUrl, configAnonKey);
+    setConfigSavedNotice(true);
+    setTimeout(() => {
+      setConfigSavedNotice(false);
+      setShowConfigModal(false);
+    }, 1500);
+  };
+
+  // Clear runtime credentials
+  const handleClearConfig = () => {
+    clearSupabaseConfig();
+    setConfigUrl('');
+    setConfigAnonKey('');
+    setShowConfigModal(false);
   };
 
   // Tool status toggle
@@ -295,67 +465,252 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     document.body.removeChild(link);
   };
 
-  // If not logged in, render secure login form
-  if (!isAuthenticated) {
+  // If checking active session, render loading state
+  if (isCheckingSession) {
     return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
-        <div className="w-full max-w-md bg-slate-800 rounded-2xl border border-slate-700 p-8 shadow-xl">
-          <div className="flex items-center gap-2 mb-6">
-            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">
-              AI
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-4">
+        <div className="flex items-center gap-3 text-slate-300">
+          <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
+          <span className="text-sm font-medium">Verifying Supabase Administrator Session...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // If not logged in, render secure Supabase Auth login portal
+  if (!isAuthenticated) {
+    const isConfigured = isSupabaseConfigured();
+
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4 relative">
+        <div className="w-full max-w-md bg-slate-900 rounded-2xl border border-slate-800 p-8 shadow-2xl">
+          {/* Header & Wordmark */}
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-bold text-base shadow-sm">
+                AI
+              </div>
+              <div>
+                <h1 className="text-base font-bold text-white tracking-tight">Admin Operations Console</h1>
+                <p className="text-[11px] text-slate-400">PostgreSQL RLS & Supabase Auth</p>
+              </div>
             </div>
-            <h1 className="text-lg font-bold text-white">Administrator Authentication</h1>
+
+            {/* Supabase Connection Status Pill */}
+            <button
+              onClick={() => setShowConfigModal(true)}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border transition-colors cursor-pointer ${
+                isConfigured
+                  ? 'bg-emerald-950/60 border-emerald-800 text-emerald-400 hover:bg-emerald-900/60'
+                  : 'bg-amber-950/60 border-amber-800 text-amber-400 hover:bg-amber-900/60'
+              }`}
+              title="Click to view or edit Supabase configuration"
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+              <span>{isConfigured ? 'Supabase Connected' : 'Config Required'}</span>
+            </button>
           </div>
+
           <p className="text-xs text-slate-400 mb-6 leading-relaxed">
-            Authorized access only. All administrative modifications are audited and recorded in immutable logs.
+            Restricted access for verified administrators. Authenticates with Supabase Auth and enforces active role validation in <code className="text-indigo-400">public.admin_users</code>.
           </p>
 
+          {/* Error Message */}
           {authError && (
-            <div className="p-3 mb-4 bg-rose-950/60 border border-rose-800 text-rose-300 text-xs rounded-lg">
-              {authError}
+            <div className="p-3.5 mb-5 bg-rose-950/70 border border-rose-800/80 text-rose-300 text-xs rounded-xl flex items-start gap-2.5 leading-relaxed">
+              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div className="flex-1">{authError}</div>
             </div>
           )}
 
+          {/* Success Message */}
+          {resetMessage && (
+            <div className="p-3.5 mb-5 bg-emerald-950/70 border border-emerald-800/80 text-emerald-300 text-xs rounded-xl flex items-start gap-2.5 leading-relaxed">
+              <Check className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+              <div className="flex-1">{resetMessage}</div>
+            </div>
+          )}
+
+          {/* Login Form */}
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">Administrator Email</label>
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                Administrator Email
+              </label>
               <input
                 type="email"
                 required
                 value={adminEmail}
                 onChange={e => setAdminEmail(e.target.value)}
-                placeholder="admin@aitoolsdirectory.internal"
-                className="w-full px-3 py-2 text-xs text-white bg-slate-900 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                placeholder="owner@yourdomain.com"
+                className="w-full px-3.5 py-2.5 text-xs text-white bg-slate-950 border border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors"
               />
             </div>
+
             <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">Security Key / Password</label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="block text-xs font-semibold text-slate-300">
+                  Password
+                </label>
+                <button
+                  type="button"
+                  onClick={handlePasswordReset}
+                  className="text-[11px] text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                >
+                  Forgot password?
+                </button>
+              </div>
               <input
                 type="password"
                 required
                 value={adminPassword}
                 onChange={e => setAdminPassword(e.target.value)}
                 placeholder="••••••••••••"
-                className="w-full px-3 py-2 text-xs text-white bg-slate-900 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="w-full px-3.5 py-2.5 text-xs text-white bg-slate-950 border border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors"
               />
             </div>
+
             <button
               type="submit"
-              className="w-full py-2.5 px-4 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors cursor-pointer"
+              disabled={isLoggingIn}
+              className="w-full py-2.5 px-4 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:cursor-not-allowed rounded-xl transition-all shadow-md shadow-indigo-900/30 cursor-pointer flex items-center justify-center gap-2"
             >
-              Sign In to Admin Console
+              {isLoggingIn ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Verifying Credentials...</span>
+                </>
+              ) : (
+                <>
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>Sign In with Supabase Auth</span>
+                </>
+              )}
             </button>
-            <div className="text-center pt-2">
-              <button
-                type="button"
-                onClick={onBackToSite}
-                className="text-xs text-slate-400 hover:text-slate-200"
-              >
-                Return to Public Website
-              </button>
-            </div>
           </form>
+
+          {/* Bootstrap Helper Accordion */}
+          <div className="mt-6 pt-5 border-t border-slate-800 text-xs">
+            <div className="bg-slate-950/60 rounded-xl p-3.5 border border-slate-800 text-slate-400 space-y-2">
+              <div className="flex items-center gap-2 text-slate-300 font-semibold text-[11px]">
+                <Info className="w-3.5 h-3.5 text-indigo-400" />
+                <span>First time setting up your Super Admin?</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                1. Create your user account in Supabase Authentication → Users.<br />
+                2. Run <code className="text-indigo-300">supabase/bootstrap_super_admin.sql</code> in your Supabase SQL Editor with your User UID.<br />
+                3. Sign in here with your Supabase email and password.
+              </p>
+            </div>
+          </div>
+
+          {/* Footer Actions */}
+          <div className="flex items-center justify-between mt-6 pt-2">
+            <button
+              type="button"
+              onClick={() => setShowConfigModal(true)}
+              className="text-xs text-slate-400 hover:text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              <Settings className="w-3.5 h-3.5" />
+              <span>Configure Supabase</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onBackToSite}
+              className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+            >
+              Return to Public Site →
+            </button>
+          </div>
         </div>
+
+        {/* Supabase Configuration Modal */}
+        {showConfigModal && (
+          <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <Database className="w-5 h-5 text-indigo-400" />
+                  <h3 className="text-sm font-bold text-white">Supabase Connection Settings</h3>
+                </div>
+                <button
+                  onClick={() => setShowConfigModal(false)}
+                  className="text-xs text-slate-400 hover:text-white cursor-pointer px-2 py-1"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-400 mb-4 leading-relaxed">
+                Connect your Supabase project credentials. These are used client-side for Supabase Auth and directory queries. You can also define them in <code className="text-indigo-300">.env</code> as <code className="text-indigo-300">VITE_SUPABASE_URL</code> and <code className="text-indigo-300">VITE_SUPABASE_ANON_KEY</code>.
+              </p>
+
+              {configSavedNotice && (
+                <div className="p-3 mb-4 bg-emerald-950/70 border border-emerald-800 text-emerald-300 text-xs rounded-xl flex items-center gap-2">
+                  <Check className="w-4 h-4 text-emerald-400" />
+                  <span>Configuration saved successfully! Reloading...</span>
+                </div>
+              )}
+
+              <form onSubmit={handleSaveConfig} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1">
+                    Supabase Project URL
+                  </label>
+                  <input
+                    type="url"
+                    required
+                    placeholder="https://xyzcompany.supabase.co"
+                    value={configUrl}
+                    onChange={e => setConfigUrl(e.target.value)}
+                    className="w-full px-3 py-2 text-xs text-white bg-slate-950 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1">
+                    Supabase Anon Public Key
+                  </label>
+                  <textarea
+                    required
+                    rows={3}
+                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    value={configAnonKey}
+                    onChange={e => setConfigAnonKey(e.target.value)}
+                    className="w-full px-3 py-2 text-xs text-white bg-slate-950 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono resize-none"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between pt-2">
+                  <button
+                    type="button"
+                    onClick={handleClearConfig}
+                    className="text-xs text-rose-400 hover:text-rose-300 cursor-pointer"
+                  >
+                    Clear Credentials
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowConfigModal(false)}
+                      className="px-3 py-1.5 text-xs text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors cursor-pointer"
+                    >
+                      Save & Connect
+                    </button>
+                  </div>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -369,31 +724,74 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     return matchSearch && matchStatus;
   });
 
+  const isConfigured = isSupabaseConfigured();
+
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col">
-      {/* Admin Header */}
+      {/* Admin Header with Profile & Supabase Badges */}
       <header className="bg-slate-900 text-white border-b border-slate-800">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+          {/* Left: Branding & Operations Console Title */}
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-sm">
+            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-sm shadow-sm">
               AI
             </div>
             <div>
-              <span className="font-bold text-sm block">Directory Operations Console</span>
-              <span className="text-[11px] text-slate-400 font-mono">PostgreSQL RLS Protected</span>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-sm block">Directory Operations Console</span>
+                {/* Role Badge */}
+                {adminProfile?.role === 'super_admin' && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-purple-950 text-purple-300 border border-purple-800">
+                    <Crown className="w-3 h-3 text-purple-400" />
+                    <span>Super Admin</span>
+                  </span>
+                )}
+                {adminProfile?.role === 'editor' && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-950 text-blue-300 border border-blue-800">
+                    <ShieldCheck className="w-3 h-3 text-blue-400" />
+                    <span>Editor</span>
+                  </span>
+                )}
+                {adminProfile?.role === 'moderator' && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-300 border border-emerald-800">
+                    <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                    <span>Moderator</span>
+                  </span>
+                )}
+              </div>
+              <span className="text-[11px] text-slate-400 font-mono">
+                {adminProfile?.email || 'admin@aitoolsdirectory.internal'}
+              </span>
             </div>
           </div>
-          <div className="flex items-center gap-4">
+
+          {/* Right: Quick Settings, Supabase Status & Logout */}
+          <div className="flex items-center gap-3">
+            {/* Supabase Status Pill */}
+            <button
+              onClick={() => setShowConfigModal(true)}
+              className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border transition-colors cursor-pointer ${
+                isConfigured
+                  ? 'bg-emerald-950/60 border-emerald-800 text-emerald-400 hover:bg-emerald-900/60'
+                  : 'bg-amber-950/60 border-amber-800 text-amber-400 hover:bg-amber-900/60'
+              }`}
+              title="Click to view or edit Supabase configuration"
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+              <span>{isConfigured ? 'Supabase Auth' : 'Local Fallback'}</span>
+            </button>
+
             <button
               onClick={onBackToSite}
-              className="text-xs text-slate-300 hover:text-white flex items-center gap-1 cursor-pointer"
+              className="text-xs text-slate-300 hover:text-white flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
             >
               <ExternalLink className="w-3.5 h-3.5" />
               <span>Public Directory</span>
             </button>
+
             <button
               onClick={handleLogout}
-              className="px-3 py-1.5 text-xs font-medium text-rose-300 hover:text-rose-100 bg-rose-950/40 hover:bg-rose-900/50 border border-rose-900/60 rounded-lg transition-colors cursor-pointer"
+              className="px-3 py-1.5 text-xs font-semibold text-rose-300 hover:text-rose-100 bg-rose-950/40 hover:bg-rose-900/50 border border-rose-900/60 rounded-lg transition-colors cursor-pointer"
             >
               Sign Out
             </button>

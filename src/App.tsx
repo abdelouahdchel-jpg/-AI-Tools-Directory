@@ -27,8 +27,18 @@ import { ComparisonDrawer } from './components/ComparisonDrawer';
 import { AdminDashboard } from './components/AdminDashboard';
 
 export default function App() {
-  // Navigation & View State
-  const [currentView, setCurrentView] = useState<string>('home');
+  // Navigation & View State - Initialize from URL pathname or hash (e.g. /admin or #/admin)
+  const [currentView, setCurrentView] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const path = window.location.pathname.toLowerCase();
+      const hash = window.location.hash.toLowerCase();
+      if (path === '/admin' || hash === '#/admin' || window.location.search.includes('view=admin')) {
+        return 'admin';
+      }
+    }
+    return 'home';
+  });
+
   const [selectedToolSlug, setSelectedToolSlug] = useState<string | null>(null);
   const [selectedBlogSlug, setSelectedBlogSlug] = useState<string | undefined>(undefined);
 
@@ -48,6 +58,26 @@ export default function App() {
 
   // Categories list
   const [categories, setCategories] = useState<Category[]>(() => directoryStorage.getCategories());
+
+  // Listen to browser back/forward and URL changes
+  useEffect(() => {
+    const handleLocationChange = () => {
+      const path = window.location.pathname.toLowerCase();
+      const hash = window.location.hash.toLowerCase();
+      if (path === '/admin' || hash === '#/admin' || window.location.search.includes('view=admin')) {
+        setCurrentView('admin');
+      } else if (currentView === 'admin' && path !== '/admin' && hash !== '#/admin') {
+        setCurrentView('home');
+      }
+    };
+
+    window.addEventListener('popstate', handleLocationChange);
+    window.addEventListener('hashchange', handleLocationChange);
+    return () => {
+      window.removeEventListener('popstate', handleLocationChange);
+      window.removeEventListener('hashchange', handleLocationChange);
+    };
+  }, [currentView]);
 
   // Listen to comparison list changes
   const handleToggleCompare = (toolId: string) => {
@@ -76,10 +106,26 @@ export default function App() {
     setCurrentPage(p => p);
   };
 
-  // Navigation router helper
+  // Navigation router helper with URL synchronization
   const handleNavigate = (view: string, param?: string) => {
     setCurrentView(view);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (view === 'admin') {
+      try {
+        window.history.pushState(null, '', '/admin');
+      } catch {
+        window.location.hash = '/admin';
+      }
+    } else {
+      if (window.location.pathname === '/admin' || window.location.hash === '#/admin') {
+        try {
+          window.history.pushState(null, '', '/');
+        } catch {
+          window.location.hash = '';
+        }
+      }
+    }
 
     if (view === 'all-tools') {
       if (param === 'featured') {
@@ -141,7 +187,7 @@ export default function App() {
 
   // If inside Admin Console, render dedicated admin view
   if (currentView === 'admin') {
-    return <AdminDashboard onBackToSite={() => setCurrentView('home')} />;
+    return <AdminDashboard onBackToSite={() => handleNavigate('home')} />;
   }
 
   return (
