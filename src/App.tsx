@@ -11,10 +11,16 @@ import {
   ArrowUpDown,
   ChevronLeft,
   ChevronRight,
-  ShieldCheck
+  ShieldCheck,
+  AlertTriangle,
+  Loader2,
+  RefreshCw,
+  Database,
+  Settings
 } from 'lucide-react';
 import { Tool, Category, PricingType } from './types/database';
 import { directoryStorage } from './services/storage';
+import { isSupabaseConfigured } from './lib/supabase';
 import { Navbar } from './components/Navbar';
 import { Footer } from './components/Footer';
 import { Hero } from './components/Hero';
@@ -42,6 +48,16 @@ export default function App() {
   const [selectedToolSlug, setSelectedToolSlug] = useState<string | null>(null);
   const [selectedBlogSlug, setSelectedBlogSlug] = useState<string | undefined>(undefined);
 
+  // Supabase Data Fetching & Sync State
+  const [dataFetchState, setDataFetchState] = useState<{
+    status: 'loading' | 'live' | 'cached' | 'error' | 'empty' | 'unconfigured';
+    error?: string;
+    cacheTimestamp?: string;
+  }>({ status: 'loading' });
+
+  // Timestamp trigger for memo recalculations when live tools arrive
+  const [dataVersion, setDataVersion] = useState<number>(0);
+
   // Search & Filter State
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -58,6 +74,76 @@ export default function App() {
 
   // Categories list
   const [categories, setCategories] = useState<Category[]>(() => directoryStorage.getCategories());
+
+  // Fetch published tools strictly from Supabase
+  const loadPublishedTools = async () => {
+    setDataFetchState(prev => ({ ...prev, status: 'loading', error: undefined }));
+    try {
+      if (!isSupabaseConfigured()) {
+        const cached = directoryStorage.getCachedPublishedTools();
+        if (cached && cached.tools.length > 0) {
+          directoryStorage.setPublishedTools(cached.tools, cached.categories);
+          setCategories(directoryStorage.getCategories());
+          setDataVersion(v => v + 1);
+          setDataFetchState({
+            status: 'cached',
+            cacheTimestamp: cached.timestamp,
+            error: 'Supabase credentials are not configured. Displaying local offline cache snapshot.'
+          });
+        } else {
+          directoryStorage.setPublishedTools([]);
+          setCategories(directoryStorage.getCategories());
+          setDataVersion(v => v + 1);
+          setDataFetchState({
+            status: 'unconfigured',
+            error: 'Supabase credentials are not configured. Configure your project in Admin Console.'
+          });
+        }
+        return;
+      }
+
+      const res = await directoryStorage.fetchPublishedTools();
+      setCategories(directoryStorage.getCategories());
+      setDataVersion(v => v + 1);
+
+      if (res.tools.length === 0) {
+        setDataFetchState({ status: 'empty' });
+      } else if (res.fromCache) {
+        setDataFetchState({
+          status: 'cached',
+          cacheTimestamp: res.cacheTimestamp,
+          error: res.error || 'Connection to Supabase failed. Displaying local offline cache snapshot.'
+        });
+      } else {
+        setDataFetchState({ status: 'live' });
+      }
+    } catch (err: any) {
+      console.warn('Failed to load published tools from Supabase:', err);
+      const cached = directoryStorage.getCachedPublishedTools();
+      if (cached && cached.tools.length > 0) {
+        directoryStorage.setPublishedTools(cached.tools, cached.categories);
+        setCategories(directoryStorage.getCategories());
+        setDataVersion(v => v + 1);
+        setDataFetchState({
+          status: 'cached',
+          cacheTimestamp: cached.timestamp,
+          error: err.message || 'Connection to Supabase failed. Displaying local offline cache snapshot.'
+        });
+      } else {
+        directoryStorage.setPublishedTools([]);
+        setCategories(directoryStorage.getCategories());
+        setDataVersion(v => v + 1);
+        setDataFetchState({
+          status: 'error',
+          error: err.message || 'Failed to connect to Supabase database.'
+        });
+      }
+    }
+  };
+
+  useEffect(() => {
+    loadPublishedTools();
+  }, []);
 
   // Listen to browser back/forward and URL changes
   useEffect(() => {
@@ -162,20 +248,20 @@ export default function App() {
       page: currentPage,
       pageSize
     });
-  }, [searchQuery, selectedCategory, selectedPricing, onlyFeatured, onlyVerified, sortBy, currentPage]);
+  }, [searchQuery, selectedCategory, selectedPricing, onlyFeatured, onlyVerified, sortBy, currentPage, dataVersion]);
 
-  const allTools = useMemo(() => directoryStorage.getAllToolsAdmin(), [currentPage]);
+  const allTools = useMemo(() => directoryStorage.getAllToolsAdmin(), [currentPage, dataVersion]);
 
   // Selected Tool for detail view
   const currentTool = useMemo(() => {
     if (!selectedToolSlug) return null;
     return directoryStorage.getToolBySlug(selectedToolSlug) || null;
-  }, [selectedToolSlug, allTools]);
+  }, [selectedToolSlug, allTools, dataVersion]);
 
   // Tools currently in comparison
   const comparedTools = useMemo(() => {
     return compareList.map(id => directoryStorage.getToolById(id)).filter(Boolean) as Tool[];
-  }, [compareList, allTools]);
+  }, [compareList, allTools, dataVersion]);
 
   // Pricing filter toggle helper
   const togglePricingFilter = (type: PricingType) => {
@@ -223,6 +309,35 @@ export default function App() {
             )}
 
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+              {/* Prominent Offline Cache Warning Banner */}
+              {dataFetchState.status === 'cached' && (
+                <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-900 shadow-xs">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-xs uppercase tracking-wider text-amber-800">
+                          Offline Cache Mode (نسخة مخبأة محلياً)
+                        </span>
+                        <span className="text-[10px] font-mono px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full border border-amber-200">
+                          Snapshot: {dataFetchState.cacheTimestamp ? new Date(dataFetchState.cacheTimestamp).toLocaleString() : 'Saved locally'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-amber-700 mt-1 leading-relaxed">
+                        Direct connection to Supabase failed. Tools displayed are from a local cache snapshot and may not reflect real-time updates.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={loadPublishedTools}
+                    className="px-3.5 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition-colors shrink-0 flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Retry Connection</span>
+                  </button>
+                </div>
+              )}
+
               {/* Directory Filter Bar & Controls */}
               <div className="bg-white rounded-xl border border-slate-200 p-4 mb-8 shadow-xs">
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
@@ -291,11 +406,25 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Right: Sort Dropdown & Result Count */}
-                  <div className="flex items-center justify-between lg:justify-end gap-4 shrink-0">
-                    <span className="text-xs text-slate-500 font-mono tabular-nums">
-                      {queryResult.total} {queryResult.total === 1 ? 'tool' : 'tools'} listed
-                    </span>
+                  {/* Right: Sort Dropdown, Result Count & Supabase Sync Badge */}
+                  <div className="flex items-center justify-between lg:justify-end gap-3 shrink-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-slate-500 font-mono tabular-nums">
+                        {queryResult.total} {queryResult.total === 1 ? 'tool' : 'tools'} listed
+                      </span>
+                      {dataFetchState.status === 'live' && (
+                        <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                          <span>Supabase Live</span>
+                        </span>
+                      )}
+                      {dataFetchState.status === 'cached' && (
+                        <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                          <span>Cached</span>
+                        </span>
+                      )}
+                    </div>
 
                     <div className="flex items-center gap-1.5 text-xs text-slate-600">
                       <ArrowUpDown className="w-3.5 h-3.5 text-slate-400" />
@@ -318,8 +447,108 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Tools Grid */}
-              {queryResult.tools.length === 0 ? (
+              {/* State-Aware Content Area */}
+              {dataFetchState.status === 'loading' ? (
+                /* LOADING SKELETON STATE */
+                <div className="space-y-6">
+                  <div className="flex items-center justify-center gap-2 py-4 text-xs font-medium text-slate-500">
+                    <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+                    <span>Connecting to Supabase and retrieving published tools...</span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {[1, 2, 3, 4, 5, 6].map(i => (
+                      <div key={i} className="bg-white rounded-xl border border-slate-200 p-5 space-y-4 animate-pulse">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-lg bg-slate-200 shrink-0" />
+                          <div className="flex-1 space-y-2">
+                            <div className="h-4 bg-slate-200 rounded w-2/3" />
+                            <div className="h-3 bg-slate-100 rounded w-1/3" />
+                          </div>
+                        </div>
+                        <div className="space-y-2 pt-2">
+                          <div className="h-3 bg-slate-100 rounded w-full" />
+                          <div className="h-3 bg-slate-100 rounded w-4/5" />
+                        </div>
+                        <div className="flex items-center justify-between pt-3 border-t border-slate-100">
+                          <div className="h-5 bg-slate-100 rounded w-16" />
+                          <div className="h-5 bg-slate-100 rounded w-12" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : dataFetchState.status === 'unconfigured' ? (
+                /* UNCONFIGURED DATABASE STATE */
+                <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center max-w-lg mx-auto my-8 shadow-xs">
+                  <div className="w-12 h-12 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center mx-auto mb-4 border border-indigo-100">
+                    <Database className="w-6 h-6" />
+                  </div>
+                  <h3 className="text-base font-bold text-slate-900 mb-1">Supabase Database Connection Required</h3>
+                  <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+                    The public AI Tools Directory is configured to read published tools directly from Supabase via PostgreSQL RLS. Connect your Supabase project credentials in the Admin Console or define environment variables.
+                  </p>
+                  <div className="flex items-center justify-center gap-3">
+                    <button
+                      onClick={() => handleNavigate('admin')}
+                      className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Settings className="w-3.5 h-3.5" />
+                      <span>Open Admin Console</span>
+                    </button>
+                    <button
+                      onClick={loadPublishedTools}
+                      className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Check Again</span>
+                    </button>
+                  </div>
+                </div>
+              ) : dataFetchState.status === 'error' ? (
+                /* DATABASE CONNECTION ERROR STATE */
+                <div className="bg-white rounded-2xl border border-rose-200 p-10 text-center max-w-lg mx-auto my-8 shadow-xs">
+                  <div className="w-12 h-12 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center mx-auto mb-4 border border-rose-100">
+                    <AlertTriangle className="w-6 h-6" />
+                  </div>
+                  <h3 className="text-base font-bold text-slate-900 mb-1">Database Connection Failed</h3>
+                  <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+                    Unable to retrieve published tools from Supabase. {dataFetchState.error || 'Please check network connectivity or database service availability.'}
+                  </p>
+                  <div className="flex items-center justify-center gap-3">
+                    <button
+                      onClick={loadPublishedTools}
+                      className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Retry Connection</span>
+                    </button>
+                    <button
+                      onClick={() => handleNavigate('admin')}
+                      className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+                    >
+                      Admin Console
+                    </button>
+                  </div>
+                </div>
+              ) : dataFetchState.status === 'empty' ? (
+                /* EMPTY DATABASE STATE */
+                <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center max-w-lg mx-auto my-8 shadow-xs">
+                  <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mx-auto mb-4">
+                    <Search className="w-6 h-6" />
+                  </div>
+                  <h3 className="text-base font-bold text-slate-900 mb-1">No Published Tools in Supabase</h3>
+                  <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+                    Supabase is connected, but no tools have been set to &quot;published&quot; status yet. You can seed initial tools or publish drafts in the Admin Console.
+                  </p>
+                  <button
+                    onClick={() => handleNavigate('admin')}
+                    className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Open Admin Console
+                  </button>
+                </div>
+              ) : queryResult.tools.length === 0 ? (
+                /* SEARCH / FILTER EMPTY STATE */
                 <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center max-w-md mx-auto">
                   <Search className="w-10 h-10 text-slate-300 mx-auto mb-3" />
                   <h3 className="text-base font-bold text-slate-900 mb-1">No AI Tools Match Your Query</h3>
@@ -340,6 +569,7 @@ export default function App() {
                   </button>
                 </div>
               ) : (
+                /* NORMAL TOOLS GRID */
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {queryResult.tools.map(tool => (
                     <ToolCard

@@ -60,24 +60,9 @@ interface AdminDashboardProps {
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) => {
   // Supabase Authentication & Admin Authorization state
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    return sessionStorage.getItem('admin_authenticated') === 'true';
-  });
-  const [adminProfile, setAdminProfile] = useState<AdminProfile | null>(() => {
-    const savedEmail = sessionStorage.getItem('admin_user');
-    const savedRole = sessionStorage.getItem('admin_role') as any;
-    if (savedEmail && savedRole) {
-      return {
-        id: sessionStorage.getItem('admin_uid') || 'cached-id',
-        email: savedEmail,
-        full_name: sessionStorage.getItem('admin_name') || 'Administrator',
-        role: savedRole,
-        is_active: true,
-        created_at: new Date().toISOString()
-      };
-    }
-    return null;
-  });
+  // Initial state is strictly unauthenticated until verified with authoritative Supabase session
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [adminProfile, setAdminProfile] = useState<AdminProfile | null>(null);
 
   const [isCheckingSession, setIsCheckingSession] = useState(true);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -154,10 +139,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
             if (authSession.adminProfile.full_name) {
               sessionStorage.setItem('admin_name', authSession.adminProfile.full_name);
             }
+          } else if (isMounted) {
+            // Invalid or expired session
+            setIsAuthenticated(false);
+            setAdminProfile(null);
+            sessionStorage.removeItem('admin_authenticated');
+            sessionStorage.removeItem('admin_user');
+            sessionStorage.removeItem('admin_uid');
+            sessionStorage.removeItem('admin_role');
+            sessionStorage.removeItem('admin_name');
           }
+        } else if (isMounted) {
+          // Supabase is not configured - strictly deny access
+          setIsAuthenticated(false);
+          setAdminProfile(null);
+          sessionStorage.removeItem('admin_authenticated');
+          sessionStorage.removeItem('admin_user');
+          sessionStorage.removeItem('admin_uid');
+          sessionStorage.removeItem('admin_role');
+          sessionStorage.removeItem('admin_name');
         }
       } catch {
-        // Fallback to current state
+        if (isMounted) {
+          setIsAuthenticated(false);
+          setAdminProfile(null);
+        }
       } finally {
         if (isMounted) setIsCheckingSession(false);
       }
@@ -173,54 +179,39 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     }
   }, [isAuthenticated]);
 
-  // Handle Login via Supabase Auth
+  // Handle Login exclusively via Supabase Auth
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
     setResetMessage('');
+
+    if (!isSupabaseConfigured()) {
+      setAuthError('Supabase is not configured. Please connect your Supabase Project URL and Anon Public Key first.');
+      return;
+    }
+
     setIsLoggingIn(true);
 
     try {
-      if (isSupabaseConfigured()) {
-        // Authenticate with Supabase Auth and verify role in public.admin_users
-        const authSession = await signInAdminWithSupabase(adminEmail, adminPassword);
-        setAdminProfile(authSession.adminProfile);
-        setIsAuthenticated(true);
-        sessionStorage.setItem('admin_authenticated', 'true');
-        sessionStorage.setItem('admin_user', authSession.adminProfile.email);
-        sessionStorage.setItem('admin_uid', authSession.adminProfile.id);
-        sessionStorage.setItem('admin_role', authSession.adminProfile.role);
-        if (authSession.adminProfile.full_name) {
-          sessionStorage.setItem('admin_name', authSession.adminProfile.full_name);
-        }
-        directoryStorage.logAuditAction('admin_login', 'auth', authSession.adminProfile.email, {
-          method: 'supabase_auth',
-          uid: authSession.user.id,
-          role: authSession.adminProfile.role
-        });
-      } else {
-        // If Supabase credentials are not connected yet:
-        if (adminEmail.includes('@') && adminPassword.length >= 6) {
-          const fallbackProfile: AdminProfile = {
-            id: 'local-admin-sim',
-            email: adminEmail.trim().toLowerCase(),
-            full_name: 'Local Administrator',
-            role: 'super_admin',
-            is_active: true,
-            created_at: new Date().toISOString()
-          };
-          setAdminProfile(fallbackProfile);
-          setIsAuthenticated(true);
-          sessionStorage.setItem('admin_authenticated', 'true');
-          sessionStorage.setItem('admin_user', adminEmail);
-          sessionStorage.setItem('admin_uid', fallbackProfile.id);
-          sessionStorage.setItem('admin_role', 'super_admin');
-          directoryStorage.logAuditAction('admin_login', 'auth', adminEmail, { method: 'local_offline_auth' });
-        } else {
-          setAuthError('Invalid credentials. Password must be at least 6 characters.');
-        }
+      // Authenticate with Supabase Auth and verify role in public.admin_users
+      const authSession = await signInAdminWithSupabase(adminEmail, adminPassword);
+      setAdminProfile(authSession.adminProfile);
+      setIsAuthenticated(true);
+      sessionStorage.setItem('admin_authenticated', 'true');
+      sessionStorage.setItem('admin_user', authSession.adminProfile.email);
+      sessionStorage.setItem('admin_uid', authSession.adminProfile.id);
+      sessionStorage.setItem('admin_role', authSession.adminProfile.role);
+      if (authSession.adminProfile.full_name) {
+        sessionStorage.setItem('admin_name', authSession.adminProfile.full_name);
       }
+      directoryStorage.logAuditAction('admin_login', 'auth', authSession.adminProfile.email, {
+        method: 'supabase_auth',
+        uid: authSession.user.id,
+        role: authSession.adminProfile.role
+      });
     } catch (err: any) {
+      setIsAuthenticated(false);
+      setAdminProfile(null);
       setAuthError(err.message || 'Authentication failed. Please verify credentials.');
     } finally {
       setIsLoggingIn(false);
@@ -512,8 +503,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
           </div>
 
           <p className="text-xs text-slate-400 mb-6 leading-relaxed">
-            Restricted access for verified administrators. Authenticates with Supabase Auth and enforces active role validation in <code className="text-indigo-400">public.admin_users</code>.
+            Restricted access for verified administrators. Authenticates exclusively with Supabase Auth and enforces active role validation in <code className="text-indigo-400 font-mono">public.admin_users</code>.
           </p>
+
+          {/* Unconfigured Alert Banner */}
+          {!isConfigured && (
+            <div className="p-3.5 mb-5 bg-amber-950/70 border border-amber-800/80 text-amber-300 text-xs rounded-xl flex items-start gap-2.5 leading-relaxed">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <span className="font-semibold block mb-0.5 text-amber-200">Supabase Connection Required</span>
+                Supabase credentials are not detected. Administrator login requires a valid Supabase project. Click &quot;Configure Supabase&quot; below to set your project credentials.
+              </div>
+            </div>
+          )}
 
           {/* Error Message */}
           {authError && (
@@ -540,10 +542,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
               <input
                 type="email"
                 required
+                disabled={!isConfigured}
                 value={adminEmail}
                 onChange={e => setAdminEmail(e.target.value)}
                 placeholder="owner@yourdomain.com"
-                className="w-full px-3.5 py-2.5 text-xs text-white bg-slate-950 border border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors"
+                className="w-full px-3.5 py-2.5 text-xs text-white bg-slate-950 border border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               />
             </div>
 
@@ -555,7 +558,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                 <button
                   type="button"
                   onClick={handlePasswordReset}
-                  className="text-[11px] text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                  disabled={!isConfigured}
+                  className="text-[11px] text-indigo-400 hover:text-indigo-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
                 >
                   Forgot password?
                 </button>
@@ -563,22 +567,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
               <input
                 type="password"
                 required
+                disabled={!isConfigured}
                 value={adminPassword}
                 onChange={e => setAdminPassword(e.target.value)}
                 placeholder="••••••••••••"
-                className="w-full px-3.5 py-2.5 text-xs text-white bg-slate-950 border border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors"
+                className="w-full px-3.5 py-2.5 text-xs text-white bg-slate-950 border border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               />
             </div>
 
             <button
               type="submit"
-              disabled={isLoggingIn}
-              className="w-full py-2.5 px-4 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:cursor-not-allowed rounded-xl transition-all shadow-md shadow-indigo-900/30 cursor-pointer flex items-center justify-center gap-2"
+              disabled={isLoggingIn || !isConfigured}
+              className="w-full py-2.5 px-4 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-500 disabled:border disabled:border-slate-700/60 disabled:cursor-not-allowed rounded-xl transition-all shadow-md shadow-indigo-900/30 cursor-pointer flex items-center justify-center gap-2"
             >
               {isLoggingIn ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
                   <span>Verifying Credentials...</span>
+                </>
+              ) : !isConfigured ? (
+                <>
+                  <Lock className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Configure Supabase to Sign In</span>
                 </>
               ) : (
                 <>
@@ -778,7 +788,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
               title="Click to view or edit Supabase configuration"
             >
               <span className={`w-1.5 h-1.5 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-              <span>{isConfigured ? 'Supabase Auth' : 'Local Fallback'}</span>
+              <span>{isConfigured ? 'Supabase Auth' : 'Config Required'}</span>
             </button>
 
             <button

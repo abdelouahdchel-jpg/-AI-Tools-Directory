@@ -6,10 +6,12 @@ import {
   ImportBatch,
   ImportError,
   DirectoryFilters,
-  PricingType
+  PricingType,
+  PricingPlan
 } from '../types/database';
 import { INITIAL_CATEGORIES, INITIAL_TOOLS } from '../data/initialData';
 import { normalizeDomain, generateSlug, ToolImportRowSchema } from '../lib/validation';
+import { getSupabase, isSupabaseConfigured } from '../lib/supabase';
 
 const STORAGE_KEYS = {
   TOOLS: 'ai_dir_tools_v1',
@@ -19,8 +21,17 @@ const STORAGE_KEYS = {
   IMPORT_BATCHES: 'ai_dir_import_batches_v1',
   IMPORT_ERRORS: 'ai_dir_import_errors_v1',
   BOOKMARKS: 'ai_dir_bookmarks_v1',
-  COMPARE_LIST: 'ai_dir_compare_v1'
+  COMPARE_LIST: 'ai_dir_compare_v1',
+  PUBLISHED_CACHE: 'ai_dir_published_cache_v2'
 };
+
+export interface FetchPublishedToolsResult {
+  tools: Tool[];
+  categories: Category[];
+  fromCache: boolean;
+  cacheTimestamp?: string;
+  error?: string;
+}
 
 class DirectoryStorageService {
   private tools: Tool[] = [];
@@ -29,6 +40,11 @@ class DirectoryStorageService {
   private auditLogs: AuditLog[] = [];
   private importBatches: ImportBatch[] = [];
   private importErrors: ImportError[] = [];
+
+  // Dedicated state for Supabase published tools
+  private publishedTools: Tool[] = [];
+  private isUsingCache: boolean = false;
+  private cacheTimestamp?: string;
 
   constructor() {
     this.init();
@@ -42,6 +58,14 @@ class DirectoryStorageService {
       } else {
         this.categories = [...INITIAL_CATEGORIES];
         this.saveCategories();
+      }
+
+      // Check if we have an existing published tools cache from Supabase
+      const cachedPublished = this.getCachedPublishedTools();
+      if (cachedPublished && Array.isArray(cachedPublished.tools) && cachedPublished.tools.length > 0) {
+        this.publishedTools = cachedPublished.tools;
+        this.isUsingCache = true;
+        this.cacheTimestamp = cachedPublished.timestamp;
       }
 
       const storedTools = localStorage.getItem(STORAGE_KEYS.TOOLS);
@@ -158,12 +182,255 @@ class DirectoryStorageService {
     return [...this.auditLogs];
   }
 
+  // ====================================================================
+  // SUPABASE PUBLISHED TOOLS INTEGRATION & LOCAL CACHE
+  // ====================================================================
+
+  /**
+   * Retrieve cached published tools snapshot if available.
+   */
+  public getCachedPublishedTools(): { tools: Tool[]; categories: Category[]; timestamp: string } | null {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEYS.PUBLISHED_CACHE);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && Array.isArray(parsed.tools)) {
+          return {
+            tools: parsed.tools,
+            categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+            timestamp: parsed.timestamp || new Date().toISOString()
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  /**
+   * Save a snapshot of published tools to localStorage as fallback cache.
+   */
+  public savePublishedCache(tools: Tool[], categories: Category[]): void {
+    try {
+      const payload = {
+        timestamp: new Date().toISOString(),
+        tools,
+        categories,
+        version: 2
+      };
+      localStorage.setItem(STORAGE_KEYS.PUBLISHED_CACHE, JSON.stringify(payload));
+    } catch (e) {
+      console.warn('Failed to save published tools cache', e);
+    }
+  }
+
+  public setPublishedTools(tools: Tool[], categories?: Category[]): void {
+    this.publishedTools = tools;
+    if (categories && categories.length > 0) {
+      this.categories = categories;
+    }
+  }
+
+  public getPublishedTools(): Tool[] {
+    return [...this.publishedTools];
+  }
+
+  public isCacheActive(): boolean {
+    return this.isUsingCache;
+  }
+
+  public getCacheTimestamp(): string | undefined {
+    return this.cacheTimestamp;
+  }
+
+  /**
+   * Fetch only verified, published tools from Supabase with categories, pricing, features, and alternatives.
+   * If offline or unconfigured, falls back to local cache snapshot with explicit fromCache flag.
+   */
+  public async fetchPublishedTools(): Promise<FetchPublishedToolsResult> {
+    const client = getSupabase();
+    if (!client || !isSupabaseConfigured()) {
+      const cached = this.getCachedPublishedTools();
+      if (cached && cached.tools.length > 0) {
+        this.publishedTools = cached.tools;
+        if (cached.categories.length > 0) this.categories = cached.categories;
+        this.isUsingCache = true;
+        this.cacheTimestamp = cached.timestamp;
+        return {
+          tools: this.publishedTools,
+          categories: this.categories,
+          fromCache: true,
+          cacheTimestamp: cached.timestamp,
+          error: 'Supabase credentials not configured. Displaying local offline cache.'
+        };
+      }
+      this.publishedTools = [];
+      this.isUsingCache = false;
+      this.cacheTimestamp = undefined;
+      throw new Error('Supabase is not configured. Project URL and Anon Public Key are required.');
+    }
+
+    try {
+      // 1. Fetch published tools from Supabase (strictly publication_status = 'published')
+      const { data: toolsData, error: toolsError } = await client
+        .from('tools')
+        .select('*')
+        .eq('publication_status', 'published')
+        .order('featured', { ascending: false })
+        .order('upvotes', { ascending: false });
+
+      if (toolsError) throw toolsError;
+
+      // 2. Fetch categories from Supabase
+      const { data: categoriesData, error: categoriesError } = await client
+        .from('categories')
+        .select('*')
+        .order('display_order', { ascending: true });
+
+      if (categoriesError) throw categoriesError;
+
+      const rawTools = toolsData || [];
+      const rawCategories: Category[] = categoriesData || [];
+      const toolIds = rawTools.map((t: any) => t.id);
+
+      const toolCategoriesMap: Record<string, string[]> = {};
+      const pricingPlansMap: Record<string, PricingPlan[]> = {};
+      const toolFeaturesMap: Record<string, string[]> = {};
+      const toolAlternativesMap: Record<string, string[]> = {};
+
+      if (toolIds.length > 0) {
+        const [tcRes, ppRes, tfRes, taRes] = await Promise.all([
+          client.from('tool_categories').select('tool_id, category_id, is_primary').in('tool_id', toolIds),
+          client.from('pricing_plans').select('*').in('tool_id', toolIds),
+          client.from('tool_features').select('*').in('tool_id', toolIds),
+          client.from('tool_alternatives').select('*').in('tool_id', toolIds)
+        ]);
+
+        if (tcRes.data) {
+          tcRes.data.forEach((tc: any) => {
+            if (!toolCategoriesMap[tc.tool_id]) toolCategoriesMap[tc.tool_id] = [];
+            toolCategoriesMap[tc.tool_id].push(tc.category_id);
+          });
+        }
+
+        if (ppRes.data) {
+          ppRes.data.forEach((pp: any) => {
+            if (!pricingPlansMap[pp.tool_id]) pricingPlansMap[pp.tool_id] = [];
+            pricingPlansMap[pp.tool_id].push({
+              id: pp.id,
+              tool_id: pp.tool_id,
+              plan_name: pp.plan_name,
+              price: Number(pp.price) || 0,
+              billing_period: pp.billing_period || 'monthly',
+              currency: pp.currency || 'USD',
+              description: pp.description || '',
+              features: Array.isArray(pp.features) ? pp.features : [],
+              source_url: pp.source_url,
+              last_verified_at: pp.last_verified_at
+            });
+          });
+        }
+
+        if (tfRes.data) {
+          tfRes.data.forEach((tf: any) => {
+            if (!toolFeaturesMap[tf.tool_id]) toolFeaturesMap[tf.tool_id] = [];
+            toolFeaturesMap[tf.tool_id].push(tf.feature_name);
+          });
+        }
+
+        if (taRes.data) {
+          taRes.data.forEach((ta: any) => {
+            if (!toolAlternativesMap[ta.tool_id]) toolAlternativesMap[ta.tool_id] = [];
+            toolAlternativesMap[ta.tool_id].push(ta.alternative_tool_id);
+          });
+        }
+      }
+
+      // Map rows to Tool interface
+      const mappedTools: Tool[] = rawTools.map((row: any) => {
+        const assignedCatIds = toolCategoriesMap[row.id] || [];
+        const toolCats = rawCategories.filter(c => assignedCatIds.includes(c.id));
+
+        return {
+          id: row.id,
+          name: row.name,
+          slug: row.slug,
+          website_url: row.website_url,
+          normalized_domain: row.normalized_domain || '',
+          short_description: row.short_description || '',
+          full_description: row.full_description || row.short_description || '',
+          logo_url: row.logo_url || '',
+          pricing_type: row.pricing_type || 'unknown',
+          starting_price: Number(row.starting_price) || 0,
+          currency: row.currency || 'USD',
+          affiliate_url: row.affiliate_url || '',
+          official_source_url: row.official_source_url || row.website_url,
+          data_source: row.data_source || 'supabase',
+          source_license: row.source_license || '',
+          source_attribution: row.source_attribution || '',
+          verification_status: row.verification_status || 'unverified',
+          publication_status: row.publication_status || 'published',
+          featured: Boolean(row.featured),
+          sponsored: Boolean(row.sponsored),
+          sponsored_until: row.sponsored_until,
+          upvotes: Number(row.upvotes) || 0,
+          views_count: Number(row.views_count) || 0,
+          categories: toolCats.length > 0 ? toolCats : (rawCategories.slice(0, 1) || []),
+          pricing_plans: pricingPlansMap[row.id] || [],
+          features: toolFeaturesMap[row.id] || [],
+          alternatives: toolAlternativesMap[row.id] || [],
+          last_verified_at: row.last_verified_at,
+          created_at: row.created_at,
+          updated_at: row.updated_at
+        };
+      });
+
+      this.publishedTools = mappedTools;
+      if (rawCategories.length > 0) {
+        this.categories = rawCategories;
+      }
+      this.isUsingCache = false;
+      this.cacheTimestamp = undefined;
+
+      // Update backup cache
+      this.savePublishedCache(mappedTools, this.categories);
+
+      return {
+        tools: mappedTools,
+        categories: this.categories,
+        fromCache: false
+      };
+    } catch (err: any) {
+      console.warn('Failed to fetch from Supabase, attempting offline cache...', err);
+      const cached = this.getCachedPublishedTools();
+      if (cached && cached.tools.length > 0) {
+        this.publishedTools = cached.tools;
+        if (cached.categories.length > 0) this.categories = cached.categories;
+        this.isUsingCache = true;
+        this.cacheTimestamp = cached.timestamp;
+        return {
+          tools: this.publishedTools,
+          categories: this.categories,
+          fromCache: true,
+          cacheTimestamp: cached.timestamp,
+          error: err.message || 'Connection to Supabase failed. Displaying cached version.'
+        };
+      }
+      this.publishedTools = [];
+      this.isUsingCache = false;
+      this.cacheTimestamp = undefined;
+      throw err;
+    }
+  }
+
   // Categories
   public getCategories(): Category[] {
-    // augment with tool counts
+    // augment with tool counts from published tools
+    const sourceTools = this.publishedTools.length > 0 ? this.publishedTools : this.tools;
     return this.categories.map(cat => ({
       ...cat,
-      tool_count: this.tools.filter(t => 
+      tool_count: sourceTools.filter(t => 
         t.publication_status === 'published' && 
         t.categories.some(c => c.id === cat.id || c.slug === cat.slug)
       ).length
@@ -193,7 +460,7 @@ class DirectoryStorageService {
     pageSize: number;
     totalPages: number;
   } {
-    let result = this.tools.filter(t => t.publication_status === 'published');
+    let result = this.publishedTools.filter(t => t.publication_status === 'published');
 
     // Search query
     if (filters.searchQuery && filters.searchQuery.trim() !== '') {
@@ -274,31 +541,38 @@ class DirectoryStorageService {
   }
 
   public getToolBySlug(slug: string): Tool | undefined {
-    return this.tools.find(t => t.slug === slug);
+    return this.publishedTools.find(t => t.slug === slug) || this.tools.find(t => t.slug === slug);
   }
 
   public getToolById(id: string): Tool | undefined {
-    return this.tools.find(t => t.id === id);
+    return this.publishedTools.find(t => t.id === id) || this.tools.find(t => t.id === id);
   }
 
   public getRelatedTools(tool: Tool, limit = 4): Tool[] {
     const categorySlugs = new Set(tool.categories.map(c => c.slug));
-    return this.tools
+    const source = this.publishedTools.length > 0 ? this.publishedTools : this.tools;
+    return source
       .filter(t => t.id !== tool.id && t.publication_status === 'published')
       .filter(t => t.categories.some(c => categorySlugs.has(c.slug)))
       .slice(0, limit);
   }
 
   public recordToolView(toolId: string) {
-    const tool = this.tools.find(t => t.id === toolId);
+    const tool = this.publishedTools.find(t => t.id === toolId) || this.tools.find(t => t.id === toolId);
     if (tool) {
       tool.views_count = (tool.views_count || 0) + 1;
       this.saveTools();
+
+      // Best-effort remote update if Supabase is active
+      const client = getSupabase();
+      if (client && isSupabaseConfigured()) {
+        client.from('tools').update({ views_count: tool.views_count }).eq('id', tool.id).then();
+      }
     }
   }
 
   public toggleUpvote(toolId: string): number {
-    const tool = this.tools.find(t => t.id === toolId);
+    const tool = this.publishedTools.find(t => t.id === toolId) || this.tools.find(t => t.id === toolId);
     if (tool) {
       const upvotedKey = `tool_upvoted_${toolId}`;
       const hasUpvoted = localStorage.getItem(upvotedKey) === 'true';
@@ -310,6 +584,16 @@ class DirectoryStorageService {
         localStorage.setItem(upvotedKey, 'true');
       }
       this.saveTools();
+
+      // Best-effort remote update if Supabase is active
+      const client = getSupabase();
+      if (client && isSupabaseConfigured()) {
+        client.from('tools').update({ upvotes: tool.upvotes }).eq('id', tool.id).then();
+      }
+
+      if (this.publishedTools.length > 0) {
+        this.savePublishedCache(this.publishedTools, this.categories);
+      }
       return tool.upvotes;
     }
     return 0;
@@ -400,6 +684,21 @@ class DirectoryStorageService {
     };
     this.submissions.unshift(newSubmission);
     this.saveSubmissions();
+
+    // Persist to Supabase submissions table if configured
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      client.from('submissions').insert({
+        tool_name: submission.tool_name,
+        website_url: submission.website_url,
+        submitter_email: submission.submitter_email,
+        description: submission.description,
+        pricing_type: submission.pricing_type || 'unknown',
+        source_information: submission.source_information || null,
+        status: 'pending'
+      }).then();
+    }
+
     return newSubmission;
   }
 
