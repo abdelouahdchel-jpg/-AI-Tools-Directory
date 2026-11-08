@@ -7,7 +7,9 @@ import {
   ImportError,
   DirectoryFilters,
   PricingType,
-  PricingPlan
+  PricingPlan,
+  PublicationStatus,
+  VerificationStatus
 } from '../types/database';
 import { INITIAL_CATEGORIES, INITIAL_TOOLS } from '../data/initialData';
 import { normalizeDomain, generateSlug, ToolImportRowSchema } from '../lib/validation';
@@ -599,7 +601,600 @@ class DirectoryStorageService {
     return 0;
   }
 
-  // Admin Tools Management
+  // ====================================================================
+  // SUPABASE ADMIN DATA QUERIES & REAL RECORD MUTATIONS
+  // ====================================================================
+
+  /**
+   * Fetch ALL tools from Supabase (including published, draft, pending, rejected)
+   * Enforced via Supabase RLS ('Admins manage tools' policy).
+   */
+  public async fetchAdminTools(): Promise<Tool[]> {
+    const client = getSupabase();
+    if (!client || !isSupabaseConfigured()) {
+      return [...this.tools];
+    }
+
+    try {
+      const { data: toolsData, error: toolsError } = await client
+        .from('tools')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (toolsError) throw toolsError;
+
+      const { data: categoriesData, error: catError } = await client
+        .from('categories')
+        .select('*')
+        .order('display_order', { ascending: true });
+
+      if (catError) throw catError;
+
+      const rawTools = toolsData || [];
+      const rawCategories: Category[] = categoriesData || [];
+      const toolIds = rawTools.map((t: any) => t.id);
+
+      const toolCategoriesMap: Record<string, string[]> = {};
+      if (toolIds.length > 0) {
+        const { data: tcData } = await client
+          .from('tool_categories')
+          .select('tool_id, category_id')
+          .in('tool_id', toolIds);
+
+        if (tcData) {
+          tcData.forEach((tc: any) => {
+            if (!toolCategoriesMap[tc.tool_id]) toolCategoriesMap[tc.tool_id] = [];
+            toolCategoriesMap[tc.tool_id].push(tc.category_id);
+          });
+        }
+      }
+
+      const mappedTools: Tool[] = rawTools.map((row: any) => {
+        const assignedCatIds = toolCategoriesMap[row.id] || [];
+        const toolCats = rawCategories.filter(c => assignedCatIds.includes(c.id));
+
+        return {
+          id: row.id,
+          name: row.name,
+          slug: row.slug,
+          website_url: row.website_url,
+          normalized_domain: row.normalized_domain || '',
+          short_description: row.short_description || '',
+          full_description: row.full_description || row.short_description || '',
+          logo_url: row.logo_url || '',
+          pricing_type: row.pricing_type || 'unknown',
+          starting_price: Number(row.starting_price) || 0,
+          currency: row.currency || 'USD',
+          affiliate_url: row.affiliate_url || '',
+          official_source_url: row.official_source_url || row.website_url,
+          data_source: row.data_source || 'supabase',
+          source_license: row.source_license || '',
+          source_attribution: row.source_attribution || '',
+          verification_status: row.verification_status || 'unverified',
+          publication_status: row.publication_status || 'draft',
+          featured: Boolean(row.featured),
+          sponsored: Boolean(row.sponsored),
+          sponsored_until: row.sponsored_until,
+          upvotes: Number(row.upvotes) || 0,
+          views_count: Number(row.views_count) || 0,
+          categories: toolCats.length > 0 ? toolCats : (rawCategories.slice(0, 1) || []),
+          last_verified_at: row.last_verified_at,
+          created_at: row.created_at,
+          updated_at: row.updated_at
+        };
+      });
+
+      this.tools = mappedTools;
+      if (rawCategories.length > 0) {
+        this.categories = rawCategories;
+      }
+      this.saveTools();
+      return mappedTools;
+    } catch (err) {
+      console.warn('Failed to fetch tools from Supabase, falling back to local:', err);
+      return [...this.tools];
+    }
+  }
+
+  /**
+   * Fetch all submissions from public.submissions via Supabase RLS
+   */
+  public async fetchAdminSubmissions(): Promise<Submission[]> {
+    const client = getSupabase();
+    if (!client || !isSupabaseConfigured()) {
+      return [...this.submissions];
+    }
+
+    try {
+      const { data, error } = await client
+        .from('submissions')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      const mapped: Submission[] = (data || []).map((row: any) => ({
+        id: row.id,
+        tool_name: row.tool_name,
+        website_url: row.website_url,
+        submitter_email: row.submitter_email,
+        description: row.description,
+        pricing_type: row.pricing_type || 'unknown',
+        source_information: row.source_information || undefined,
+        status: row.status || 'pending',
+        admin_notes: row.admin_notes || undefined,
+        created_at: row.created_at
+      }));
+
+      this.submissions = mapped;
+      this.saveSubmissions();
+      return mapped;
+    } catch (err) {
+      console.warn('Failed to fetch submissions from Supabase:', err);
+      return [...this.submissions];
+    }
+  }
+
+  /**
+   * Fetch categories from public.categories
+   */
+  public async fetchAdminCategories(): Promise<Category[]> {
+    const client = getSupabase();
+    if (!client || !isSupabaseConfigured()) {
+      return this.getCategories();
+    }
+
+    try {
+      const { data, error } = await client
+        .from('categories')
+        .select('*')
+        .order('display_order', { ascending: true });
+
+      if (error) throw error;
+
+      const mapped: Category[] = (data || []).map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        slug: row.slug,
+        description: row.description || '',
+        icon_name: row.icon_name || 'Sparkles',
+        display_order: row.display_order ?? 0,
+        tool_count: this.tools.filter(t => t.categories.some(c => c.id === row.id || c.slug === row.slug)).length,
+        created_at: row.created_at,
+        updated_at: row.updated_at
+      }));
+
+      this.categories = mapped;
+      this.saveCategories();
+      return mapped;
+    } catch (err) {
+      console.warn('Failed to fetch categories from Supabase:', err);
+      return this.getCategories();
+    }
+  }
+
+  /**
+   * Fetch audit logs from public.audit_logs
+   */
+  public async fetchAdminAuditLogs(): Promise<AuditLog[]> {
+    const client = getSupabase();
+    if (!client || !isSupabaseConfigured()) {
+      return [...this.auditLogs];
+    }
+
+    try {
+      const { data, error } = await client
+        .from('audit_logs')
+        .select('*')
+        .order('timestamp', { ascending: false })
+        .limit(100);
+
+      if (error) throw error;
+
+      const mapped: AuditLog[] = (data || []).map((row: any) => ({
+        id: row.id,
+        administrator_id: row.administrator_id,
+        administrator_email: row.administrator_email || 'admin@aitoolsdirectory.internal',
+        action: row.action,
+        entity_type: row.entity_type,
+        entity_id: row.entity_id || '',
+        metadata: row.metadata || {},
+        timestamp: row.timestamp
+      }));
+
+      this.auditLogs = mapped;
+      this.saveAuditLogs();
+      return mapped;
+    } catch (err) {
+      console.warn('Failed to fetch audit logs from Supabase:', err);
+      return [...this.auditLogs];
+    }
+  }
+
+  /**
+   * Fetch import batches from public.import_batches
+   */
+  public async fetchAdminBatches(): Promise<ImportBatch[]> {
+    const client = getSupabase();
+    if (!client || !isSupabaseConfigured()) {
+      return [...this.importBatches];
+    }
+
+    try {
+      const { data, error } = await client
+        .from('import_batches')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      const mapped: ImportBatch[] = (data || []).map((row: any) => ({
+        id: row.id,
+        filename: row.filename,
+        source_name: row.source_name,
+        source_type: row.source_type,
+        total_rows: row.total_rows || 0,
+        valid_rows: row.valid_rows || 0,
+        inserted_rows: row.inserted_rows || 0,
+        updated_rows: row.updated_rows || 0,
+        duplicate_rows: row.duplicate_rows || 0,
+        rejected_rows: row.rejected_rows || 0,
+        status: row.status,
+        error_summary: row.error_summary,
+        created_at: row.created_at,
+        completed_at: row.completed_at
+      }));
+
+      this.importBatches = mapped;
+      this.saveBatches();
+      return mapped;
+    } catch (err) {
+      console.warn('Failed to fetch import batches from Supabase:', err);
+      return [...this.importBatches];
+    }
+  }
+
+  /**
+   * Toggle publication status directly in public.tools
+   */
+  public async toggleToolPublicationAdmin(toolId: string, currentStatus: PublicationStatus): Promise<PublicationStatus> {
+    const newStatus: PublicationStatus = currentStatus === 'published' ? 'draft' : 'published';
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      const { error } = await client
+        .from('tools')
+        .update({
+          publication_status: newStatus,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', toolId);
+
+      if (error) throw error;
+      await this.logAuditActionRemote('toggle_publication', 'tool', toolId, { previous: currentStatus, next: newStatus });
+    }
+
+    const tool = this.tools.find(t => t.id === toolId);
+    if (tool) {
+      tool.publication_status = newStatus;
+      tool.updated_at = new Date().toISOString();
+      this.saveTools();
+    }
+    return newStatus;
+  }
+
+  /**
+   * Toggle verification status directly in public.tools
+   */
+  public async toggleToolVerificationAdmin(toolId: string, currentStatus: VerificationStatus): Promise<VerificationStatus> {
+    const newStatus: VerificationStatus = currentStatus === 'verified' ? 'unverified' : 'verified';
+    const lastVerified = newStatus === 'verified' ? new Date().toISOString() : null;
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      const { error } = await client
+        .from('tools')
+        .update({
+          verification_status: newStatus,
+          last_verified_at: lastVerified,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', toolId);
+
+      if (error) throw error;
+      await this.logAuditActionRemote('toggle_verification', 'tool', toolId, { previous: currentStatus, next: newStatus });
+    }
+
+    const tool = this.tools.find(t => t.id === toolId);
+    if (tool) {
+      tool.verification_status = newStatus;
+      tool.last_verified_at = lastVerified || undefined;
+      tool.updated_at = new Date().toISOString();
+      this.saveTools();
+    }
+    return newStatus;
+  }
+
+  /**
+   * Delete a tool from public.tools (cascades to related tables via RLS)
+   */
+  public async deleteToolAdmin(toolId: string): Promise<boolean> {
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      const { error } = await client.from('tools').delete().eq('id', toolId);
+      if (error) throw error;
+      await this.logAuditActionRemote('delete_tool', 'tool', toolId);
+    }
+
+    const index = this.tools.findIndex(t => t.id === toolId);
+    if (index !== -1) {
+      this.tools.splice(index, 1);
+      this.saveTools();
+    }
+    return true;
+  }
+
+  /**
+   * Save or Update tool in public.tools and maintain tool_categories relations
+   */
+  public async saveOrUpdateToolAdmin(toolData: Partial<Tool> & { name: string; website_url: string }): Promise<Tool> {
+    const normalizedDomain = normalizeDomain(toolData.website_url);
+    const slug = toolData.slug || generateSlug(toolData.name);
+    const client = getSupabase();
+
+    const isUUID = Boolean(toolData.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(toolData.id));
+
+    if (client && isSupabaseConfigured()) {
+      if (isUUID && toolData.id) {
+        // UPDATE existing tool in Supabase
+        const { error: updateError } = await client
+          .from('tools')
+          .update({
+            name: toolData.name,
+            slug,
+            website_url: toolData.website_url,
+            normalized_domain: normalizedDomain,
+            short_description: toolData.short_description || '',
+            full_description: toolData.full_description || toolData.short_description || '',
+            pricing_type: toolData.pricing_type || 'unknown',
+            starting_price: toolData.starting_price ?? null,
+            currency: toolData.currency || 'USD',
+            publication_status: toolData.publication_status || 'draft',
+            verification_status: toolData.verification_status || 'unverified',
+            last_verified_at: toolData.verification_status === 'verified' ? (toolData.last_verified_at || new Date().toISOString()) : null,
+            featured: Boolean(toolData.featured),
+            sponsored: Boolean(toolData.sponsored),
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', toolData.id);
+
+        if (updateError) throw updateError;
+
+        if (toolData.categories && toolData.categories.length > 0) {
+          const validCatIds = toolData.categories
+            .map(c => c.id)
+            .filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+
+          if (validCatIds.length > 0) {
+            await client.from('tool_categories').delete().eq('tool_id', toolData.id);
+            const catInserts = validCatIds.map((cid, idx) => ({
+              tool_id: toolData.id,
+              category_id: cid,
+              is_primary: idx === 0
+            }));
+            await client.from('tool_categories').insert(catInserts);
+          }
+        }
+
+        await this.logAuditActionRemote('update_tool', 'tool', toolData.id, { name: toolData.name });
+        return {
+          ...toolData,
+          id: toolData.id,
+          normalized_domain: normalizedDomain,
+          slug,
+          categories: toolData.categories || []
+        } as Tool;
+      } else {
+        // INSERT new tool into Supabase
+        const { data: insertData, error: insertError } = await client
+          .from('tools')
+          .insert({
+            name: toolData.name,
+            slug,
+            website_url: toolData.website_url,
+            normalized_domain: normalizedDomain,
+            short_description: toolData.short_description || '',
+            full_description: toolData.full_description || toolData.short_description || '',
+            logo_url: toolData.logo_url || null,
+            pricing_type: toolData.pricing_type || 'unknown',
+            starting_price: toolData.starting_price ?? null,
+            currency: toolData.currency || 'USD',
+            data_source: toolData.data_source || 'manual_admin_entry',
+            publication_status: toolData.publication_status || 'draft',
+            verification_status: toolData.verification_status || 'unverified',
+            last_verified_at: toolData.verification_status === 'verified' ? new Date().toISOString() : null,
+            featured: Boolean(toolData.featured),
+            sponsored: Boolean(toolData.sponsored),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .select()
+          .single();
+
+        if (insertError) throw insertError;
+
+        const newId = insertData.id;
+        if (toolData.categories && toolData.categories.length > 0) {
+          const validCatIds = toolData.categories
+            .map(c => c.id)
+            .filter(id => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+
+          if (validCatIds.length > 0) {
+            const catInserts = validCatIds.map((cid, idx) => ({
+              tool_id: newId,
+              category_id: cid,
+              is_primary: idx === 0
+            }));
+            await client.from('tool_categories').insert(catInserts);
+          }
+        }
+
+        await this.logAuditActionRemote('create_tool', 'tool', newId, { name: toolData.name });
+        return {
+          ...toolData,
+          id: newId,
+          normalized_domain: normalizedDomain,
+          slug,
+          categories: toolData.categories || []
+        } as Tool;
+      }
+    }
+
+    return this.saveOrUpdateTool(toolData);
+  }
+
+  /**
+   * Review Community Submission in public.submissions
+   * If approved, creates a new draft tool in public.tools
+   */
+  public async reviewSubmissionAdmin(submissionId: string, status: 'approved' | 'rejected', notes = ''): Promise<Submission | null> {
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      const now = new Date().toISOString();
+      const { data: subData, error: subError } = await client
+        .from('submissions')
+        .update({
+          status,
+          admin_notes: notes || null,
+          reviewed_at: now
+        })
+        .eq('id', submissionId)
+        .select()
+        .single();
+
+      if (subError) throw subError;
+
+      if (status === 'approved' && subData) {
+        const domain = normalizeDomain(subData.website_url);
+        const slug = generateSlug(subData.tool_name);
+
+        const { data: newTool, error: toolErr } = await client
+          .from('tools')
+          .insert({
+            name: subData.tool_name,
+            slug,
+            website_url: subData.website_url,
+            normalized_domain: domain,
+            short_description: subData.description.slice(0, 280),
+            full_description: subData.description,
+            pricing_type: subData.pricing_type || 'unknown',
+            data_source: 'user_submission',
+            source_attribution: 'Community submission by ' + subData.submitter_email,
+            publication_status: 'draft',
+            verification_status: 'pending_review',
+            created_at: now,
+            updated_at: now
+          })
+          .select()
+          .single();
+
+        if (!toolErr && newTool) {
+          const defaultCat = this.categories[0];
+          if (defaultCat && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(defaultCat.id)) {
+            await client.from('tool_categories').insert({
+              tool_id: newTool.id,
+              category_id: defaultCat.id,
+              is_primary: true
+            });
+          }
+        }
+      }
+
+      await this.logAuditActionRemote('review_submission', 'submission', submissionId, {
+        status,
+        tool_name: subData?.tool_name
+      });
+
+      return {
+        id: submissionId,
+        tool_name: subData?.tool_name || '',
+        website_url: subData?.website_url || '',
+        submitter_email: subData?.submitter_email || '',
+        description: subData?.description || '',
+        pricing_type: subData?.pricing_type || 'unknown',
+        status,
+        admin_notes: notes,
+        created_at: subData?.created_at || now
+      };
+    }
+
+    return this.reviewSubmission(submissionId, status, notes);
+  }
+
+  /**
+   * Add a new category in public.categories
+   */
+  public async addCategoryAdmin(name: string, description: string): Promise<Category> {
+    const slug = generateSlug(name);
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      const maxOrder = this.categories.length > 0 ? Math.max(...this.categories.map(c => c.display_order || 0)) : 0;
+      const { data, error } = await client
+        .from('categories')
+        .insert({
+          name: name.trim(),
+          slug,
+          description: description.trim() || `Tools in ${name.trim()}`,
+          icon_name: 'Sparkles',
+          display_order: maxOrder + 1
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+      const newCat: Category = {
+        id: data.id,
+        name: data.name,
+        slug: data.slug,
+        description: data.description,
+        icon_name: data.icon_name,
+        display_order: data.display_order,
+        tool_count: 0
+      };
+      this.categories.push(newCat);
+      this.saveCategories();
+      await this.logAuditActionRemote('create_category', 'category', data.id, { name: data.name });
+      return newCat;
+    }
+
+    return this.addCategory({ name, slug, description });
+  }
+
+  /**
+   * Remote-aware audit logger that records to public.audit_logs via active admin authentication
+   */
+  public async logAuditActionRemote(action: string, entityType: string, entityId: string, metadata: Record<string, unknown> = {}) {
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      try {
+        const { data: { user } } = await client.auth.getUser();
+        if (user) {
+          await client.from('audit_logs').insert({
+            administrator_id: user.id,
+            administrator_email: user.email,
+            action,
+            entity_type: entityType,
+            entity_id: String(entityId),
+            metadata: metadata || {}
+          });
+        }
+      } catch (e) {
+        console.warn('Failed to insert remote audit log:', e);
+      }
+    }
+    this.logAuditAction(action, entityType, entityId, metadata);
+  }
+
+  // Admin Tools Management (Synchronous memory accessor)
   public getAllToolsAdmin(): Tool[] {
     return [...this.tools];
   }
@@ -714,7 +1309,6 @@ class DirectoryStorageService {
     sub.admin_notes = notes;
 
     if (status === 'approved') {
-      // Create pending draft tool
       const category = this.categories.find(c => c.id === sub.category_id) || this.categories[0];
       this.saveOrUpdateTool({
         name: sub.tool_name,
@@ -915,12 +1509,372 @@ class DirectoryStorageService {
     return batchRecord;
   }
 
+  public async executeBatchImportAdmin(
+    batchMeta: { filename: string; source_name: string; source_type: 'csv' | 'json' },
+    validRows: Array<{ row: number; data: ReturnType<typeof ToolImportRowSchema.parse>; isDuplicate: boolean }>,
+    errors: Array<{ row: number; error_code: string; message: string; original_data: Record<string, unknown> }>,
+    options: { skipDuplicates: boolean; defaultStatus: 'draft' | 'pending' } = { skipDuplicates: true, defaultStatus: 'draft' }
+  ): Promise<ImportBatch> {
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      try {
+        const { data: batchData, error: batchErr } = await client
+          .from('import_batches')
+          .insert({
+            filename: batchMeta.filename,
+            source_name: batchMeta.source_name,
+            source_type: batchMeta.source_type,
+            total_rows: validRows.length + errors.length,
+            valid_rows: validRows.length,
+            inserted_rows: 0,
+            updated_rows: 0,
+            duplicate_rows: 0,
+            rejected_rows: errors.length,
+            status: 'processing'
+          })
+          .select()
+          .single();
+
+        if (batchErr) throw batchErr;
+        const batchId = batchData.id;
+
+        let inserted = 0;
+        let duplicateSkipped = 0;
+        const insertedToolIds: string[] = [];
+
+        for (const item of validRows) {
+          if (item.isDuplicate && options.skipDuplicates) {
+            duplicateSkipped++;
+            continue;
+          }
+
+          const d = item.data;
+          const domain = normalizeDomain(d.website_url);
+          const slug = generateSlug(d.name) + (item.isDuplicate ? '-' + Math.random().toString(36).substring(2, 5) : '');
+
+          const { data: newTool, error: insertErr } = await client
+            .from('tools')
+            .insert({
+              name: d.name,
+              slug,
+              website_url: d.website_url,
+              normalized_domain: domain,
+              short_description: d.short_description,
+              full_description: d.full_description,
+              logo_url: d.logo_url || null,
+              pricing_type: d.pricing_type as any,
+              starting_price: d.starting_price,
+              currency: d.currency,
+              affiliate_url: d.affiliate_url || null,
+              official_source_url: d.official_source_url || d.website_url,
+              data_source: d.data_source || batchMeta.source_name,
+              source_license: d.source_license || null,
+              source_attribution: d.source_attribution || null,
+              verification_status: 'unverified',
+              publication_status: options.defaultStatus,
+              featured: false,
+              sponsored: false
+            })
+            .select('id')
+            .single();
+
+          if (!insertErr && newTool) {
+            inserted++;
+            insertedToolIds.push(newTool.id);
+            const cat = this.categories.find(c => c.name.toLowerCase() === d.category.toLowerCase() || c.slug === generateSlug(d.category));
+            if (cat && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cat.id)) {
+              await client.from('tool_categories').insert({
+                tool_id: newTool.id,
+                category_id: cat.id,
+                is_primary: true
+              });
+            }
+          }
+        }
+
+        if (errors.length > 0) {
+          const errPayload = errors.map(e => ({
+            batch_id: batchId,
+            row_number: e.row,
+            error_code: e.error_code,
+            error_message: e.message,
+            original_data: e.original_data
+          }));
+          await client.from('import_errors').insert(errPayload);
+        }
+
+        const finalStatus = errors.length > 0 && inserted > 0 ? 'partial' : errors.length > 0 ? 'failed' : 'completed';
+        const batchSummaryPayload = JSON.stringify({
+          summary: errors.length > 0 ? `${errors.length} validation errors encountered` : 'Completed successfully',
+          created_tool_ids: insertedToolIds
+        });
+
+        const { data: finalBatch } = await client
+          .from('import_batches')
+          .update({
+            inserted_rows: inserted,
+            duplicate_rows: duplicateSkipped,
+            rejected_rows: errors.length,
+            status: finalStatus,
+            error_summary: batchSummaryPayload,
+            completed_at: new Date().toISOString()
+          })
+          .eq('id', batchId)
+          .select()
+          .single();
+
+        await this.logAuditActionRemote('execute_import_batch', 'import_batch', batchId, {
+          filename: batchMeta.filename,
+          inserted,
+          duplicates: duplicateSkipped,
+          errors: errors.length,
+          created_tool_ids: insertedToolIds
+        });
+
+        return finalBatch as ImportBatch;
+      } catch (e) {
+        console.warn('Supabase bulk import failed, falling back to local storage:', e);
+      }
+    }
+
+    return this.executeBatchImport(batchMeta, validRows, errors, options);
+  }
+
+  /**
+   * Safe Rollback of an Import Batch
+   * Only deletes tools that are:
+   * 1. Created by this batch.
+   * 2. Still in draft/pending status (never published).
+   * 3. Never verified (verification_status !== 'verified').
+   * 4. Unmodified since creation (updated_at <= created_at + 5s).
+   * Published or modified tools are strictly protected and left untouched.
+   */
+  public async rollbackBatchAdmin(batchId: string): Promise<{
+    success: boolean;
+    deletedCount: number;
+    protectedCount: number;
+    message: string;
+  }> {
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      try {
+        const { data: batch, error: batchErr } = await client
+          .from('import_batches')
+          .select('*')
+          .eq('id', batchId)
+          .single();
+
+        if (batchErr || !batch) {
+          throw new Error('Batch record not found');
+        }
+
+        if (batch.status === 'rolled_back') {
+          return {
+            success: false,
+            deletedCount: 0,
+            protectedCount: 0,
+            message: 'This batch has already been rolled back.'
+          };
+        }
+
+        let toolIds: string[] = [];
+
+        // Check error_summary JSON
+        if (batch.error_summary) {
+          try {
+            const parsed = JSON.parse(batch.error_summary);
+            if (Array.isArray(parsed.created_tool_ids)) {
+              toolIds = parsed.created_tool_ids;
+            }
+          } catch {
+            const match = batch.error_summary.match(/\[TOOL_IDS:([^\]]+)\]/);
+            if (match && match[1]) {
+              toolIds = match[1].split(',').filter(Boolean);
+            }
+          }
+        }
+
+        // Fallback: check audit_logs
+        if (toolIds.length === 0) {
+          const { data: logs } = await client
+            .from('audit_logs')
+            .select('metadata')
+            .eq('action', 'execute_import_batch')
+            .eq('entity_id', batchId)
+            .limit(1);
+
+          if (logs && logs[0] && logs[0].metadata && Array.isArray((logs[0].metadata as any).created_tool_ids)) {
+            toolIds = (logs[0].metadata as any).created_tool_ids;
+          }
+        }
+
+        // Fallback: check by source_name and creation timeframe
+        if (toolIds.length === 0 && batch.source_name) {
+          const startTime = new Date(new Date(batch.created_at).getTime() - 15000).toISOString();
+          const endTime = batch.completed_at
+            ? new Date(new Date(batch.completed_at).getTime() + 15000).toISOString()
+            : new Date(new Date(batch.created_at).getTime() + 120000).toISOString();
+
+          const { data: matchedTools } = await client
+            .from('tools')
+            .select('id')
+            .eq('data_source', batch.source_name)
+            .gte('created_at', startTime)
+            .lte('created_at', endTime);
+
+          if (matchedTools) {
+            toolIds = matchedTools.map((t: any) => t.id);
+          }
+        }
+
+        if (toolIds.length === 0) {
+          return {
+            success: false,
+            deletedCount: 0,
+            protectedCount: 0,
+            message: 'No tool records associated with this batch were found to roll back.'
+          };
+        }
+
+        // Fetch current status of candidate tools
+        const { data: candidateTools, error: toolFetchErr } = await client
+          .from('tools')
+          .select('id, name, publication_status, verification_status, created_at, updated_at')
+          .in('id', toolIds);
+
+        if (toolFetchErr) throw toolFetchErr;
+
+        let deletedCount = 0;
+        let protectedCount = 0;
+        const toolsToDelete: string[] = [];
+
+        for (const t of (candidateTools || [])) {
+          const isPublished = t.publication_status === 'published';
+          const isVerified = t.verification_status === 'verified';
+          const wasModified = t.updated_at && t.created_at && (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime() > 5000);
+
+          if (isPublished || isVerified || wasModified) {
+            protectedCount++;
+          } else {
+            toolsToDelete.push(t.id);
+          }
+        }
+
+        if (toolsToDelete.length > 0) {
+          const { error: delErr } = await client
+            .from('tools')
+            .delete()
+            .in('id', toolsToDelete);
+
+          if (delErr) throw delErr;
+          deletedCount = toolsToDelete.length;
+
+          this.tools = this.tools.filter(t => !toolsToDelete.includes(t.id));
+          this.saveTools();
+        }
+
+        // Mark batch as rolled_back
+        await client
+          .from('import_batches')
+          .update({
+            status: 'rolled_back',
+            error_summary: `Rolled back on ${new Date().toISOString()}. ${deletedCount} unedited tools removed, ${protectedCount} tools protected (published or modified).`
+          })
+          .eq('id', batchId);
+
+        await this.logAuditActionRemote('rollback_import_batch', 'import_batch', batchId, {
+          deleted_count: deletedCount,
+          protected_count: protectedCount,
+          total_batch_tools: toolIds.length
+        });
+
+        return {
+          success: true,
+          deletedCount,
+          protectedCount,
+          message: `Batch rolled back successfully: ${deletedCount} unedited draft tool${deletedCount === 1 ? '' : 's'} removed. ${protectedCount} tool${protectedCount === 1 ? ' was' : 's were'} protected (already published or edited).`
+        };
+      } catch (err: any) {
+        console.error('Failed to rollback batch:', err);
+        return {
+          success: false,
+          deletedCount: 0,
+          protectedCount: 0,
+          message: `Rollback failed: ${err.message}`
+        };
+      }
+    }
+
+    // Local in-memory fallback
+    const batch = this.importBatches.find(b => b.id === batchId);
+    if (!batch) return { success: false, deletedCount: 0, protectedCount: 0, message: 'Batch not found' };
+    if (batch.status === 'rolled_back') return { success: false, deletedCount: 0, protectedCount: 0, message: 'Batch already rolled back' };
+
+    let toolIds: string[] = [];
+    if (batch.error_summary) {
+      try {
+        const parsed = JSON.parse(batch.error_summary);
+        if (Array.isArray(parsed.created_tool_ids)) toolIds = parsed.created_tool_ids;
+      } catch {}
+    }
+
+    let deleted = 0;
+    let protectedCount = 0;
+    this.tools = this.tools.filter(t => {
+      if (toolIds.includes(t.id)) {
+        if (t.publication_status === 'published' || t.verification_status === 'verified') {
+          protectedCount++;
+          return true;
+        }
+        deleted++;
+        return false;
+      }
+      return true;
+    });
+
+    batch.status = 'rolled_back';
+    this.saveTools();
+    this.saveBatches();
+
+    return {
+      success: true,
+      deletedCount: deleted,
+      protectedCount,
+      message: `Batch rolled back: ${deleted} tools removed, ${protectedCount} tools protected.`
+    };
+  }
+
   public getImportBatches(): ImportBatch[] {
     return [...this.importBatches];
   }
 
   public getImportErrors(batchId: string): ImportError[] {
     return this.importErrors.filter(e => e.batch_id === batchId);
+  }
+
+  /**
+   * Fetch rejected rows/errors for a batch from public.import_errors via Supabase RLS
+   * with fallback to local storage
+   */
+  public async fetchAdminImportErrors(batchId: string): Promise<ImportError[]> {
+    const client = getSupabase();
+    if (client && isSupabaseConfigured()) {
+      try {
+        const { data, error } = await client
+          .from('import_errors')
+          .select('*')
+          .eq('batch_id', batchId)
+          .order('row_number', { ascending: true });
+
+        if (error) throw error;
+        if (data && data.length > 0) {
+          return data as ImportError[];
+        }
+      } catch (err) {
+        console.warn('Failed to fetch import errors from Supabase, falling back to local:', err);
+      }
+    }
+    return this.getImportErrors(batchId);
   }
 
   // Bookmarking & Compare features

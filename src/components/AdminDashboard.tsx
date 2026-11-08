@@ -25,7 +25,10 @@ import {
   Check,
   Loader2,
   Info,
-  Crown
+  Crown,
+  RotateCcw,
+  Sliders,
+  Globe
 } from 'lucide-react';
 import {
   Tool,
@@ -41,6 +44,8 @@ import {
 import { INITIAL_CATEGORIES } from '../data/initialData';
 import { directoryStorage } from '../services/storage';
 import { normalizeDomain, generateSlug } from '../lib/validation';
+import { generateRejectedRowsCsv, triggerCsvDownload } from '../lib/csvExport';
+import { verifyToolUrl, UrlVerificationResult } from '../services/urlVerifier';
 import { ToolLogo } from './ToolLogo';
 import {
   signInAdminWithSupabase,
@@ -57,6 +62,28 @@ import {
 interface AdminDashboardProps {
   onBackToSite: () => void;
 }
+
+export const TARGET_SCHEMA_FIELDS: Array<{
+  key: string;
+  label: string;
+  required: boolean;
+  description: string;
+  matchRegex: RegExp;
+}> = [
+  { key: 'name', label: 'Tool Name', required: true, description: 'Display name of the tool', matchRegex: /^(tool_?name|name|title|product_?name|app_?name|software)$/i },
+  { key: 'website_url', label: 'Website URL', required: true, description: 'Live HTTPS website URL', matchRegex: /^(website_?url|url|website|link|site|web)$/i },
+  { key: 'short_description', label: 'Short Description', required: true, description: 'One-line summary (10-280 chars)', matchRegex: /^(short_?desc(ription)?|tagline|summary|subtitle|headline)$/i },
+  { key: 'full_description', label: 'Full Description', required: false, description: 'Detailed markdown or text', matchRegex: /^(full_?desc(ription)?|desc(ription)?|details|about|overview)$/i },
+  { key: 'category', label: 'Category', required: true, description: 'Primary taxonomy category', matchRegex: /^(category(_?tag|_?name)?|categories|cat|tag|tags|topic)$/i },
+  { key: 'pricing_type', label: 'Pricing Model', required: false, description: 'free, freemium, paid, free_trial, open_source', matchRegex: /^(pricing_?type|pricing|price_?model|model|plan)$/i },
+  { key: 'starting_price', label: 'Starting Price', required: false, description: 'Numerical price (default 0)', matchRegex: /^(starting_?price|price|cost|rate|amount)$/i },
+  { key: 'currency', label: 'Currency', required: false, description: 'Currency code (default USD)', matchRegex: /^(currency|curr)$/i },
+  { key: 'logo_url', label: 'Logo URL', required: false, description: 'Direct image link', matchRegex: /^(logo_?url|logo|icon|avatar|image)$/i },
+  { key: 'official_source_url', label: 'Official Source', required: false, description: 'Documentation or official repository', matchRegex: /^(official_?source_?url|source_?url|docs_?url)$/i },
+  { key: 'source_license', label: 'License', required: false, description: 'e.g. MIT, Apache 2.0, Proprietary', matchRegex: /^(source_?license|license)$/i },
+  { key: 'source_attribution', label: 'Attribution', required: false, description: 'Citation notice', matchRegex: /^(source_?attribution|attribution|author)$/i },
+  { key: 'affiliate_url', label: 'Affiliate URL', required: false, description: 'Referral tracking link', matchRegex: /^(affiliate_?url|affiliate|referral)$/i }
+];
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) => {
   // Supabase Authentication & Admin Authorization state
@@ -94,31 +121,58 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
   // Tool Edit Modal
   const [editingTool, setEditingTool] = useState<Tool | null>(null);
   const [isToolModalOpen, setIsToolModalOpen] = useState(false);
+  const [isVerifyingUrl, setIsVerifyingUrl] = useState(false);
+  const [urlVerificationResult, setUrlVerificationResult] = useState<UrlVerificationResult | null>(null);
 
   // Bulk Import state
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importSourceName, setImportSourceName] = useState('Authorized CSV Batch');
   const [importStatusChoice, setImportStatusChoice] = useState<'draft' | 'pending'>('draft');
   const [skipDuplicates, setSkipDuplicates] = useState(true);
-  const [importStep, setImportStep] = useState<'idle' | 'parsing' | 'preview' | 'importing' | 'completed'>('idle');
+  const [importStep, setImportStep] = useState<'idle' | 'parsing' | 'mapping' | 'preview' | 'importing' | 'completed'>('idle');
   const [importProgress, setImportProgress] = useState(0);
+  const [rawImportRows, setRawImportRows] = useState<Record<string, unknown>[]>([]);
+  const [discoveredColumns, setDiscoveredColumns] = useState<string[]>([]);
+  const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
   const [validationResult, setValidationResult] = useState<{
     valid: any[];
     errors: any[];
     duplicateCount: number;
   } | null>(null);
   const [latestBatchReport, setLatestBatchReport] = useState<ImportBatch | null>(null);
+  const [exportingBatchId, setExportingBatchId] = useState<string | null>(null);
+  const [rollingBackBatchId, setRollingBackBatchId] = useState<string | null>(null);
 
   // Category creation
   const [newCatName, setNewCatName] = useState('');
   const [newCatDesc, setNewCatDesc] = useState('');
 
-  const refreshData = () => {
-    setTools(directoryStorage.getAllToolsAdmin());
-    setCategories(directoryStorage.getCategories());
-    setSubmissions(directoryStorage.getSubmissions());
-    setBatches(directoryStorage.getImportBatches());
-    setAuditLogs(directoryStorage.getAuditLogs());
+  // Data Loading & Sync State
+  const [isLoadingData, setIsLoadingData] = useState(false);
+  const [dataError, setDataError] = useState<string | null>(null);
+
+  const refreshData = async () => {
+    setIsLoadingData(true);
+    setDataError(null);
+    try {
+      const [fetchedTools, fetchedCategories, fetchedSubmissions, fetchedBatches, fetchedLogs] = await Promise.all([
+        directoryStorage.fetchAdminTools(),
+        directoryStorage.fetchAdminCategories(),
+        directoryStorage.fetchAdminSubmissions(),
+        directoryStorage.fetchAdminBatches(),
+        directoryStorage.fetchAdminAuditLogs()
+      ]);
+      setTools(fetchedTools);
+      setCategories(fetchedCategories);
+      setSubmissions(fetchedSubmissions);
+      setBatches(fetchedBatches);
+      setAuditLogs(fetchedLogs);
+    } catch (err: any) {
+      console.error('Failed to load admin data from Supabase:', err);
+      setDataError(err.message || 'Error communicating with Supabase database.');
+    } finally {
+      setIsLoadingData(false);
+    }
   };
 
   // Check active Supabase Auth session on component mount
@@ -281,51 +335,68 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     setShowConfigModal(false);
   };
 
-  // Tool status toggle
-  const handleTogglePublication = (tool: Tool) => {
-    const newStatus: PublicationStatus = tool.publication_status === 'published' ? 'draft' : 'published';
-    directoryStorage.saveOrUpdateTool({
-      ...tool,
-      publication_status: newStatus
-    });
-    refreshData();
-  };
-
-  const handleToggleVerification = (tool: Tool) => {
-    const newStatus: VerificationStatus = tool.verification_status === 'verified' ? 'unverified' : 'verified';
-    directoryStorage.saveOrUpdateTool({
-      ...tool,
-      verification_status: newStatus,
-      last_verified_at: newStatus === 'verified' ? new Date().toISOString() : undefined
-    });
-    refreshData();
-  };
-
-  const handleDeleteTool = (tool: Tool) => {
-    if (confirm(`Permanently delete '${tool.name}'?`)) {
-      directoryStorage.deleteTool(tool.id);
-      refreshData();
+  // Tool status toggle via Supabase RLS
+  const handleTogglePublication = async (tool: Tool) => {
+    try {
+      await directoryStorage.toggleToolPublicationAdmin(tool.id, tool.publication_status);
+      await refreshData();
+    } catch (err: any) {
+      alert(`Failed to update publication status: ${err.message}`);
     }
   };
 
-  // Submission review
-  const handleReviewSubmission = (id: string, status: 'approved' | 'rejected') => {
-    directoryStorage.reviewSubmission(id, status);
-    refreshData();
+  const handleToggleVerification = async (tool: Tool) => {
+    try {
+      await directoryStorage.toggleToolVerificationAdmin(tool.id, tool.verification_status);
+      await refreshData();
+    } catch (err: any) {
+      alert(`Failed to update verification status: ${err.message}`);
+    }
   };
 
-  // Add category
-  const handleAddCategory = (e: React.FormEvent) => {
+  const handleDeleteTool = async (tool: Tool) => {
+    if (confirm(`Permanently delete '${tool.name}' from Supabase database?`)) {
+      try {
+        await directoryStorage.deleteToolAdmin(tool.id);
+        await refreshData();
+      } catch (err: any) {
+        alert(`Failed to delete tool: ${err.message}`);
+      }
+    }
+  };
+
+  // Submission review via Supabase RLS
+  const handleReviewSubmission = async (id: string, status: 'approved' | 'rejected') => {
+    try {
+      await directoryStorage.reviewSubmissionAdmin(id, status);
+      await refreshData();
+    } catch (err: any) {
+      alert(`Failed to review submission: ${err.message}`);
+    }
+  };
+
+  // Add category via Supabase RLS
+  const handleAddCategory = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCatName.trim()) return;
-    directoryStorage.addCategory({
-      name: newCatName.trim(),
-      slug: generateSlug(newCatName),
-      description: newCatDesc.trim() || `Tools in ${newCatName}`
+    try {
+      await directoryStorage.addCategoryAdmin(newCatName.trim(), newCatDesc.trim());
+      setNewCatName('');
+      setNewCatDesc('');
+      await refreshData();
+    } catch (err: any) {
+      alert(`Failed to add category: ${err.message}`);
+    }
+  };
+
+  // Auto-detect column mapping
+  const autoDetectMapping = (cols: string[]): Record<string, string> => {
+    const mapping: Record<string, string> = {};
+    TARGET_SCHEMA_FIELDS.forEach(target => {
+      const found = cols.find(c => target.matchRegex.test(c.toLowerCase().trim().replace(/[\s-]+/g, '_')));
+      mapping[target.key] = found || '';
     });
-    setNewCatName('');
-    setNewCatDesc('');
-    refreshData();
+    return mapping;
   };
 
   // File parsing for Bulk Import
@@ -354,7 +425,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
             const results = Papa.parse(content, {
               header: true,
               skipEmptyLines: true,
-              transformHeader: h => h.trim().toLowerCase().replace(/\s+/g, '_')
+              transformHeader: h => h.trim()
             });
             parsedRows = results.data as Record<string, unknown>[];
           } else {
@@ -362,10 +433,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
             parsedRows = Array.isArray(json) ? json : [json];
           }
 
-          // Run validation engine
-          const result = directoryStorage.parseAndValidateBatch(parsedRows);
-          setValidationResult(result);
-          setImportStep('preview');
+          if (!parsedRows || parsedRows.length === 0) {
+            alert('The uploaded file contains no rows.');
+            setImportStep('idle');
+            return;
+          }
+
+          // Discover source column names from first rows
+          const colSet = new Set<string>();
+          parsedRows.slice(0, 10).forEach(row => {
+            if (row && typeof row === 'object') {
+              Object.keys(row).forEach(k => colSet.add(k));
+            }
+          });
+          const cols = Array.from(colSet);
+
+          setRawImportRows(parsedRows);
+          setDiscoveredColumns(cols);
+
+          const initialMapping = autoDetectMapping(cols);
+          setColumnMapping(initialMapping);
+
+          // Transition to interactive Column Mapping step
+          setImportStep('mapping');
         } catch (err: any) {
           alert('Failed to parse file: ' + err.message);
           setImportStep('idle');
@@ -375,7 +465,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     }
   };
 
-  // Run chunked batch execution
+  // Apply interactive mapping and execute validation engine
+  const applyMappingAndValidate = (customMapping?: Record<string, string>) => {
+    const mapping = customMapping || columnMapping;
+
+    if (!mapping.name || !mapping.website_url || !mapping.short_description || !mapping.category) {
+      alert('Please map all required fields (Tool Name, Website URL, Short Description, and Category).');
+      return;
+    }
+
+    const mappedRows = rawImportRows.map(raw => {
+      const row: Record<string, unknown> = {};
+      TARGET_SCHEMA_FIELDS.forEach(field => {
+        const sourceCol = mapping[field.key];
+        if (sourceCol && raw[sourceCol] !== undefined && raw[sourceCol] !== null && String(raw[sourceCol]).trim() !== '') {
+          row[field.key] = raw[sourceCol];
+        }
+      });
+
+      if (!row.full_description && row.short_description) {
+        row.full_description = row.short_description;
+      }
+      if (!row.pricing_type) {
+        row.pricing_type = 'unknown';
+      }
+      if (row.starting_price !== undefined) {
+        const num = parseFloat(String(row.starting_price).replace(/[^0-9.-]/g, ''));
+        row.starting_price = isNaN(num) ? 0 : Math.max(0, num);
+      }
+      if (!row.currency) {
+        row.currency = 'USD';
+      }
+
+      return row;
+    });
+
+    const result = directoryStorage.parseAndValidateBatch(mappedRows);
+    setValidationResult(result);
+    setImportStep('preview');
+  };
+
+  // Run chunked batch execution directly to Supabase import_batches and tools
   const executeBatch = async () => {
     if (!validationResult || !importFile) return;
 
@@ -386,31 +516,103 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     const validRows = validationResult.valid;
     const errors = validationResult.errors;
 
-    // Simulate chunked batch processing
+    // Simulate chunked progress visually
     for (let i = 0; i < validRows.length; i += chunkSize) {
-      await new Promise(r => setTimeout(r, 60));
+      await new Promise(r => setTimeout(r, 40));
       const progress = Math.min(95, Math.round(((i + chunkSize) / validRows.length) * 100));
       setImportProgress(progress);
     }
 
-    const report = directoryStorage.executeBatchImport(
-      {
-        filename: importFile.name,
-        source_name: importSourceName,
-        source_type: importFile.name.endsWith('.csv') ? 'csv' : 'json'
-      },
-      validRows,
-      errors,
-      {
-        skipDuplicates,
-        defaultStatus: importStatusChoice
+    try {
+      const report = await directoryStorage.executeBatchImportAdmin(
+        {
+          filename: importFile.name,
+          source_name: importSourceName,
+          source_type: importFile.name.endsWith('.csv') ? 'csv' : 'json'
+        },
+        validRows,
+        errors,
+        {
+          skipDuplicates,
+          defaultStatus: importStatusChoice
+        }
+      );
+
+      setLatestBatchReport(report);
+      setImportProgress(100);
+      setImportStep('completed');
+      await refreshData();
+    } catch (err: any) {
+      alert(`Bulk import error: ${err.message}`);
+      setImportStep('idle');
+    }
+  };
+
+  // Export rejected rows CSV for an import batch
+  const handleExportRejectedRows = async (batchId: string, filename?: string) => {
+    try {
+      setExportingBatchId(batchId);
+      const errors = await directoryStorage.fetchAdminImportErrors(batchId);
+      if (!errors || errors.length === 0) {
+        alert('No rejected rows found for this batch. All rows were processed cleanly without errors.');
+        return;
       }
+
+      const csvContent = generateRejectedRowsCsv(errors);
+      const safeBaseName = (filename || `batch-${batchId}`).replace(/\.[^/.]+$/, '');
+      const downloadName = `${safeBaseName}-rejected-rows.csv`;
+      triggerCsvDownload(csvContent, downloadName);
+    } catch (err: any) {
+      console.error('Failed to export rejected rows:', err);
+      alert(`Export failed: ${err.message || 'Unable to retrieve rejected rows'}`);
+    } finally {
+      setExportingBatchId(null);
+    }
+  };
+
+  // Safe Batch Rollback Handler (protects published & modified tools)
+  const handleRollbackBatch = async (batchId: string, filename: string) => {
+    const confirmed = confirm(
+      `SAFE ROLLBACK CONFIRMATION:\n\nAre you sure you want to roll back batch "${filename}"?\n\n` +
+      `• Any unedited draft tools imported by this batch will be permanently removed.\n` +
+      `• Any tools that have already been PUBLISHED or EDITED by an admin will be PROTECTED and preserved.\n\n` +
+      `Proceed with safe rollback?`
     );
 
-    setLatestBatchReport(report);
-    setImportProgress(100);
-    setImportStep('completed');
-    refreshData();
+    if (!confirmed) return;
+
+    try {
+      setRollingBackBatchId(batchId);
+      const res = await directoryStorage.rollbackBatchAdmin(batchId);
+      alert(res.message);
+      await refreshData();
+    } catch (err: any) {
+      alert(`Rollback failed: ${err.message}`);
+    } finally {
+      setRollingBackBatchId(null);
+    }
+  };
+
+  // Live URL Verification Handler for Tool Modal
+  const handleVerifyModalUrl = async () => {
+    if (!editingTool?.website_url) return;
+    setIsVerifyingUrl(true);
+    setUrlVerificationResult(null);
+    try {
+      const res = await verifyToolUrl(editingTool.website_url);
+      setUrlVerificationResult(res);
+    } catch (err: any) {
+      setUrlVerificationResult({
+        is_live: false,
+        status_code: 'UNREACHABLE',
+        final_url: editingTool.website_url,
+        response_time_ms: 0,
+        ssl_valid: false,
+        error_message: err.message
+      });
+    } finally {
+      setIsVerifyingUrl(false);
+    }
   };
 
   // Download templates
@@ -791,6 +993,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
               <span>{isConfigured ? 'Supabase Auth' : 'Config Required'}</span>
             </button>
 
+            {/* Refresh Live Button */}
+            <button
+              onClick={refreshData}
+              disabled={isLoadingData}
+              className="text-xs text-slate-300 hover:text-white flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50"
+              title="Fetch latest tools and stats from Supabase"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-indigo-400 ${isLoadingData ? 'animate-spin' : ''}`} />
+              <span>{isLoadingData ? 'Syncing...' : 'Refresh Live'}</span>
+            </button>
+
             <button
               onClick={onBackToSite}
               className="text-xs text-slate-300 hover:text-white flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
@@ -856,38 +1069,61 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
 
       {/* Main Viewport Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1 w-full">
+        {/* Error notification banner if Supabase communication fails */}
+        {dataError && (
+          <div className="mb-6 p-4 bg-rose-50 border border-rose-200 rounded-xl flex items-start justify-between gap-3 text-rose-800 shadow-xs">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-semibold text-xs block mb-0.5">Database Query Warning</span>
+                <p className="text-xs text-rose-700 leading-relaxed">{dataError}</p>
+              </div>
+            </div>
+            <button
+              onClick={refreshData}
+              className="px-3 py-1 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white rounded-lg transition-colors shrink-0 cursor-pointer"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
         {/* OVERVIEW TAB */}
         {activeTab === 'overview' && (
           <div className="space-y-8">
             {/* KPI Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="bg-white p-5 rounded-xl border border-slate-200">
+              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs">
                 <span className="text-xs text-slate-500 font-medium block mb-1">Total Cataloged Tools</span>
                 <span className="text-2xl font-bold font-mono text-slate-900 tabular-nums">{tools.length}</span>
-                <span className="text-[11px] text-slate-400 block mt-1">Scale capacity: 50,000+</span>
+                <span className="text-[11px] text-slate-400 block mt-1">Live from public.tools</span>
               </div>
-              <div className="bg-white p-5 rounded-xl border border-slate-200">
+              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs">
                 <span className="text-xs text-slate-500 font-medium block mb-1">Published (Live)</span>
                 <span className="text-2xl font-bold font-mono text-emerald-600 tabular-nums">
                   {tools.filter(t => t.publication_status === 'published').length}
                 </span>
-                <span className="text-[11px] text-slate-400 block mt-1">
-                  Drafts: {tools.filter(t => t.publication_status === 'draft').length}
-                </span>
+                <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-1">
+                  <span>Drafts: {tools.filter(t => t.publication_status === 'draft').length}</span>
+                  <span>•</span>
+                  <span>Pending: {tools.filter(t => t.publication_status === 'pending').length}</span>
+                </div>
               </div>
-              <div className="bg-white p-5 rounded-xl border border-slate-200">
+              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs">
                 <span className="text-xs text-slate-500 font-medium block mb-1">Verified Specifications</span>
                 <span className="text-2xl font-bold font-mono text-indigo-600 tabular-nums">
                   {tools.filter(t => t.verification_status === 'verified').length}
                 </span>
-                <span className="text-[11px] text-slate-400 block mt-1">Official provenance checked</span>
+                <span className="text-[11px] text-slate-400 block mt-1">
+                  Review: {tools.filter(t => t.verification_status === 'pending_review').length} · Unverified: {tools.filter(t => t.verification_status === 'unverified').length}
+                </span>
               </div>
-              <div className="bg-white p-5 rounded-xl border border-slate-200">
+              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs">
                 <span className="text-xs text-slate-500 font-medium block mb-1">Pending Submissions</span>
                 <span className="text-2xl font-bold font-mono text-amber-600 tabular-nums">
                   {submissions.filter(s => s.status === 'pending').length}
                 </span>
-                <span className="text-[11px] text-slate-400 block mt-1">Awaiting editorial review</span>
+                <span className="text-[11px] text-slate-400 block mt-1">Live from public.submissions</span>
               </div>
             </div>
 
@@ -903,14 +1139,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                 ) : (
                   <div className="space-y-3">
                     {batches.slice(0, 5).map(b => (
-                      <div key={b.id} className="text-xs p-3 bg-slate-50 rounded-lg border border-slate-100 flex items-center justify-between">
-                        <div>
-                          <span className="font-semibold text-slate-800 block">{b.filename}</span>
+                      <div key={b.id} className="text-xs p-3 bg-slate-50 rounded-lg border border-slate-100 flex items-center justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <span className="font-semibold text-slate-800 truncate block">{b.filename}</span>
                           <span className="text-[11px] text-slate-500">
-                            Inserted: {b.inserted_rows} · Duplicates Skipped: {b.duplicate_rows} · Errors: {b.rejected_rows}
+                            Inserted: {b.inserted_rows} · Duplicates: {b.duplicate_rows} · Rejected: {b.rejected_rows}
                           </span>
                         </div>
-                        <span className="font-mono text-[11px] text-slate-500 uppercase">{b.status}</span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-mono text-[11px] text-slate-500 uppercase">{b.status}</span>
+                          {b.rejected_rows > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleExportRejectedRows(b.id, b.filename)}
+                              disabled={exportingBatchId === b.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-amber-800 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded cursor-pointer transition-colors disabled:opacity-50"
+                              title={`Export ${b.rejected_rows} rejected rows as CSV`}
+                            >
+                              {exportingBatchId === b.id ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Download className="w-3 h-3" />
+                              )}
+                              <span>Errors ({b.rejected_rows})</span>
+                            </button>
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -969,6 +1223,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                   <option value="published">Published</option>
                   <option value="draft">Draft</option>
                   <option value="pending">Pending</option>
+                  <option value="rejected">Rejected</option>
+                  <option value="needs_update">Needs Update</option>
                 </select>
               </div>
 
@@ -1054,10 +1310,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                         <td className="py-2.5 px-3">
                           <button
                             onClick={() => handleTogglePublication(t)}
-                            className={`px-2 py-0.5 rounded text-[11px] font-semibold cursor-pointer ${
+                            title="Click to toggle publication status (persisted to Supabase)"
+                            className={`px-2 py-0.5 rounded text-[11px] font-semibold border transition-colors cursor-pointer ${
                               t.publication_status === 'published'
-                                ? 'bg-emerald-100 text-emerald-800'
-                                : 'bg-slate-100 text-slate-700'
+                                ? 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'
+                                : t.publication_status === 'draft'
+                                ? 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
+                                : t.publication_status === 'pending'
+                                ? 'bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200'
+                                : t.publication_status === 'rejected'
+                                ? 'bg-rose-100 text-rose-800 border-rose-300 hover:bg-rose-200'
+                                : 'bg-purple-100 text-purple-800 border-purple-300 hover:bg-purple-200'
                             }`}
                           >
                             {t.publication_status}
@@ -1066,10 +1329,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                         <td className="py-2.5 px-3">
                           <button
                             onClick={() => handleToggleVerification(t)}
-                            className={`px-2 py-0.5 rounded text-[11px] font-semibold cursor-pointer ${
+                            title="Click to toggle verification status (persisted to Supabase)"
+                            className={`px-2 py-0.5 rounded text-[11px] font-semibold border transition-colors cursor-pointer ${
                               t.verification_status === 'verified'
-                                ? 'bg-indigo-100 text-indigo-800'
-                                : 'bg-amber-100 text-amber-800'
+                                ? 'bg-indigo-100 text-indigo-800 border-indigo-300 hover:bg-indigo-200'
+                                : t.verification_status === 'pending_review'
+                                ? 'bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200'
+                                : t.verification_status === 'flagged'
+                                ? 'bg-rose-100 text-rose-800 border-rose-300 hover:bg-rose-200'
+                                : 'bg-slate-100 text-slate-700 border-slate-300 hover:bg-slate-200'
                             }`}
                           >
                             {t.verification_status}
@@ -1159,7 +1427,137 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
               {importStep === 'parsing' && (
                 <div className="p-8 text-center text-xs text-slate-600 space-y-2">
                   <RefreshCw className="w-6 h-6 text-indigo-600 animate-spin mx-auto mb-2" />
-                  <span>Validating schema and identifying duplicates...</span>
+                  <span>Parsing dataset headers and discovering columns...</span>
+                </div>
+              )}
+
+              {/* Interactive Column Mapping Step */}
+              {importStep === 'mapping' && rawImportRows.length > 0 && (
+                <div className="space-y-6">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-indigo-50 border border-indigo-200 rounded-xl">
+                    <div>
+                      <div className="flex items-center gap-2 text-indigo-950 font-bold text-sm">
+                        <Sliders className="w-4 h-4 text-indigo-600" />
+                        <span>Interactive Column Mapping</span>
+                      </div>
+                      <p className="text-xs text-indigo-800 mt-1">
+                        Loaded <strong>{rawImportRows.length}</strong> records from <em>{importFile?.name}</em>. Map your dataset's columns to directory schema attributes.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const detected = autoDetectMapping(discoveredColumns);
+                          setColumnMapping(detected);
+                        }}
+                        className="px-3 py-1.5 text-xs font-semibold text-indigo-700 bg-white hover:bg-indigo-100 border border-indigo-300 rounded-lg cursor-pointer transition-colors shadow-2xs"
+                      >
+                        Auto-Detect Best Match
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setImportStep('idle');
+                          setImportFile(null);
+                          setRawImportRows([]);
+                        }}
+                        className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-white hover:bg-slate-100 border border-slate-300 rounded-lg cursor-pointer transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Validation Notice for Required Fields */}
+                  {(!columnMapping.name || !columnMapping.website_url || !columnMapping.short_description || !columnMapping.category) && (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-2 text-amber-900 text-xs font-medium">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>
+                        Required fields not yet mapped: {
+                          [
+                            !columnMapping.name && 'Tool Name',
+                            !columnMapping.website_url && 'Website URL',
+                            !columnMapping.short_description && 'Short Description',
+                            !columnMapping.category && 'Category'
+                          ].filter(Boolean).join(', ')
+                        }. Select matching source columns to proceed.
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Mapping Table */}
+                  <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead className="bg-slate-50 text-slate-700 font-semibold border-b border-slate-200">
+                        <tr>
+                          <th className="p-3 w-1/4">Directory Schema Target</th>
+                          <th className="p-3 w-1/3">Source File Column</th>
+                          <th className="p-3 w-5/12">Sample Value (Row 1)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {TARGET_SCHEMA_FIELDS.map(target => {
+                          const selectedCol = columnMapping[target.key] || '';
+                          const sampleVal = selectedCol && rawImportRows[0] ? String(rawImportRows[0][selectedCol] ?? '') : '';
+
+                          return (
+                            <tr key={target.key} className="hover:bg-slate-50/60 transition-colors">
+                              <td className="p-3">
+                                <div className="font-semibold text-slate-900 flex items-center gap-1.5">
+                                  <span>{target.label}</span>
+                                  {target.required ? (
+                                    <span className="text-[10px] font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">Required</span>
+                                  ) : (
+                                    <span className="text-[10px] text-slate-400 font-normal">Optional</span>
+                                  )}
+                                </div>
+                                <span className="text-[11px] text-slate-500 block mt-0.5">{target.description}</span>
+                              </td>
+                              <td className="p-3">
+                                <select
+                                  value={selectedCol}
+                                  onChange={e => setColumnMapping({ ...columnMapping, [target.key]: e.target.value })}
+                                  className={`w-full px-2.5 py-1.5 border rounded-lg text-xs bg-white ${
+                                    target.required && !selectedCol ? 'border-amber-400 bg-amber-50/30' : 'border-slate-300'
+                                  }`}
+                                >
+                                  <option value="">-- Do Not Import / Default --</option>
+                                  {discoveredColumns.map(col => (
+                                    <option key={col} value={col}>{col}</option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td className="p-3 font-mono text-[11px] text-slate-600 max-w-xs truncate">
+                                {sampleVal ? (
+                                  <span className="bg-slate-100 px-2 py-1 rounded border border-slate-200 block truncate" title={sampleVal}>
+                                    {sampleVal}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400 italic">No column selected</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Action Footer */}
+                  <div className="flex items-center justify-between pt-2">
+                    <span className="text-xs text-slate-500">
+                      Parsed rows will be validated against strict Zod schema before batch execution.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => applyMappingAndValidate()}
+                      disabled={!columnMapping.name || !columnMapping.website_url || !columnMapping.short_description || !columnMapping.category}
+                      className="px-5 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg cursor-pointer transition-colors shadow-xs"
+                    >
+                      Apply Mapping & Preview Rows →
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -1259,23 +1657,34 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                   </div>
 
                   {/* Actions */}
-                  <div className="flex items-center justify-end gap-3 pt-3">
+                  <div className="flex items-center justify-between pt-3">
                     <button
-                      onClick={() => {
-                        setImportStep('idle');
-                        setImportFile(null);
-                        setValidationResult(null);
-                      }}
-                      className="px-4 py-2 text-xs text-slate-600 hover:text-slate-800 cursor-pointer"
+                      type="button"
+                      onClick={() => setImportStep('mapping')}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors shadow-2xs"
                     >
-                      Cancel
+                      <Sliders className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>← Back to Column Mapping</span>
                     </button>
-                    <button
-                      onClick={executeBatch}
-                      className="px-5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors"
-                    >
-                      Confirm and Run Import Batch
-                    </button>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => {
+                          setImportStep('idle');
+                          setImportFile(null);
+                          setValidationResult(null);
+                          setRawImportRows([]);
+                        }}
+                        className="px-4 py-2 text-xs text-slate-600 hover:text-slate-800 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={executeBatch}
+                        className="px-5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors shadow-2xs"
+                      >
+                        Confirm and Run Import Batch
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1304,7 +1713,41 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                   <p className="text-xs text-slate-700 leading-relaxed">
                     Imported <strong>{latestBatchReport.inserted_rows}</strong> records in {importStatusChoice} status. Skipped <strong>{latestBatchReport.duplicate_rows}</strong> duplicate rows.
                   </p>
-                  <div>
+
+                  {/* Rejected Rows Status & Export */}
+                  {latestBatchReport.rejected_rows > 0 ? (
+                    <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div>
+                        <div className="flex items-center gap-2 text-amber-900 font-bold text-xs">
+                          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                          <span>{latestBatchReport.rejected_rows} row{latestBatchReport.rejected_rows > 1 ? 's were' : ' was'} rejected during validation</span>
+                        </div>
+                        <p className="text-[11px] text-amber-700 mt-0.5">
+                          Download the rejected rows as CSV containing the original submitted data and explicit error codes.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleExportRejectedRows(latestBatchReport.id, latestBatchReport.filename)}
+                        disabled={exportingBatchId === latestBatchReport.id}
+                        className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg cursor-pointer transition-colors shrink-0 disabled:opacity-50"
+                      >
+                        {exportingBatchId === latestBatchReport.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Download className="w-3.5 h-3.5" />
+                        )}
+                        <span>Export Rejected Rows CSV ({latestBatchReport.rejected_rows})</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="p-3 bg-emerald-100/70 border border-emerald-200 rounded-lg flex items-center gap-2 text-emerald-800 text-xs">
+                      <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>All rows passed validation. No rejected rows exist for this batch.</span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-3 pt-2">
                     <button
                       onClick={() => {
                         setImportStep('idle');
@@ -1312,9 +1755,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                         setValidationResult(null);
                         setActiveTab('tools');
                       }}
-                      className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer"
+                      className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors"
                     >
                       View Imported Tools in Table
+                    </button>
+                    <button
+                      onClick={() => {
+                        setImportStep('idle');
+                        setImportFile(null);
+                        setValidationResult(null);
+                      }}
+                      className="px-4 py-2 text-xs font-medium text-slate-700 hover:text-slate-900 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors"
+                    >
+                      Import Another File
                     </button>
                   </div>
                 </div>
@@ -1333,17 +1786,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                       <th className="p-2.5">Source</th>
                       <th className="p-2.5">Inserted</th>
                       <th className="p-2.5">Duplicates</th>
+                      <th className="p-2.5">Rejected</th>
                       <th className="p-2.5">Status</th>
+                      <th className="p-2.5 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {batches.length === 0 ? (
                       <tr>
-                        <td colSpan={6} className="p-4 text-center text-slate-400">No import history yet.</td>
+                        <td colSpan={8} className="p-4 text-center text-slate-400">No import history yet.</td>
                       </tr>
                     ) : (
                       batches.map(b => (
-                        <tr key={b.id}>
+                        <tr key={b.id} className="hover:bg-slate-50/50">
                           <td className="p-2.5 font-mono text-[11px] text-slate-500">
                             {new Date(b.created_at).toLocaleString()}
                           </td>
@@ -1351,7 +1806,61 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                           <td className="p-2.5 text-slate-600">{b.source_name}</td>
                           <td className="p-2.5 font-mono text-emerald-600 font-bold">{b.inserted_rows}</td>
                           <td className="p-2.5 font-mono text-slate-500">{b.duplicate_rows}</td>
-                          <td className="p-2.5 font-mono uppercase text-[11px]">{b.status}</td>
+                          <td className="p-2.5 font-mono">
+                            {b.rejected_rows > 0 ? (
+                              <span className="text-amber-600 font-bold">{b.rejected_rows}</span>
+                            ) : (
+                              <span className="text-slate-400">0</span>
+                            )}
+                          </td>
+                          <td className="p-2.5 font-mono uppercase text-[11px]">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                              b.status === 'completed' ? 'bg-emerald-100 text-emerald-800' :
+                              b.status === 'partial' ? 'bg-amber-100 text-amber-800' :
+                              b.status === 'failed' ? 'bg-rose-100 text-rose-800' :
+                              b.status === 'rolled_back' ? 'bg-purple-100 text-purple-800' : 'bg-slate-100 text-slate-800'
+                            }`}>
+                              {b.status === 'rolled_back' ? 'Rolled Back' : b.status}
+                            </span>
+                          </td>
+                          <td className="p-2.5 text-right space-x-2 whitespace-nowrap">
+                            {b.rejected_rows > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => handleExportRejectedRows(b.id, b.filename)}
+                                disabled={exportingBatchId === b.id}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-md cursor-pointer transition-colors disabled:opacity-50"
+                                title="Export Rejected Rows CSV"
+                              >
+                                {exportingBatchId === b.id ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <Download className="w-3 h-3" />
+                                )}
+                                <span>Export Rejected ({b.rejected_rows})</span>
+                              </button>
+                            )}
+                            {b.status === 'rolled_back' ? (
+                              <span className="inline-flex items-center px-2 py-1 text-[10px] font-semibold text-slate-500 bg-slate-100 border border-slate-200 rounded">
+                                Rolled Back
+                              </span>
+                            ) : b.inserted_rows > 0 ? (
+                              <button
+                                type="button"
+                                onClick={() => handleRollbackBatch(b.id, b.filename)}
+                                disabled={rollingBackBatchId === b.id}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-md cursor-pointer transition-colors disabled:opacity-50"
+                                title="Safe Rollback: removes unedited draft tools, preserves published and modified tools"
+                              >
+                                {rollingBackBatchId === b.id ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <RotateCcw className="w-3 h-3" />
+                                )}
+                                <span>Rollback</span>
+                              </button>
+                            ) : null}
+                          </td>
                         </tr>
                       ))
                     )}
@@ -1553,12 +2062,55 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
 
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Official Website URL *</label>
-                <input
-                  type="url"
-                  value={editingTool.website_url}
-                  onChange={e => setEditingTool({ ...editingTool, website_url: e.target.value })}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="url"
+                    value={editingTool.website_url}
+                    onChange={e => {
+                      setEditingTool({ ...editingTool, website_url: e.target.value });
+                      setUrlVerificationResult(null);
+                    }}
+                    placeholder="https://example.com"
+                    className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleVerifyModalUrl}
+                    disabled={isVerifyingUrl || !editingTool.website_url}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg cursor-pointer transition-colors disabled:opacity-50 shrink-0"
+                    title="Live verification of URL reachability, SSL certificate, and SSRF safety"
+                  >
+                    {isVerifyingUrl ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Globe className="w-3.5 h-3.5" />
+                    )}
+                    <span>Verify Live</span>
+                  </button>
+                </div>
+
+                {/* Inline URL Verification Status Badge */}
+                {urlVerificationResult && (
+                  <div className="mt-1.5 flex items-center gap-1.5 text-[11px]">
+                    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-medium ${
+                      urlVerificationResult.is_live
+                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                        : 'bg-rose-50 text-rose-800 border border-rose-200'
+                    }`}>
+                      {urlVerificationResult.is_live ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-600" />
+                          <span>Live ({urlVerificationResult.http_status || 200} OK · {urlVerificationResult.response_time_ms}ms · SSL Valid)</span>
+                        </>
+                      ) : (
+                        <>
+                          <AlertTriangle className="w-3 h-3 text-rose-600 shrink-0" />
+                          <span>{urlVerificationResult.error_message || urlVerificationResult.status_code}</span>
+                        </>
+                      )}
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1620,6 +2172,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                     <option value="pending">pending</option>
                     <option value="published">published</option>
                     <option value="rejected">rejected</option>
+                    <option value="needs_update">needs_update</option>
                   </select>
                 </div>
                 <div>
@@ -1649,19 +2202,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                 Cancel
               </button>
               <button
-                onClick={() => {
+                onClick={async () => {
                   if (!editingTool.name || !editingTool.website_url) {
                     alert('Name and Website URL are required');
                     return;
                   }
-                  directoryStorage.saveOrUpdateTool(editingTool);
-                  setIsToolModalOpen(false);
-                  setEditingTool(null);
-                  refreshData();
+                  try {
+                    await directoryStorage.saveOrUpdateToolAdmin(editingTool);
+                    setIsToolModalOpen(false);
+                    setEditingTool(null);
+                    await refreshData();
+                  } catch (err: any) {
+                    alert(`Failed to save tool in Supabase: ${err.message}`);
+                  }
                 }}
                 className="px-5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer"
               >
-                Save Tool
+                Save Tool in Supabase
               </button>
             </div>
           </div>

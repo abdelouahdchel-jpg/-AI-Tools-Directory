@@ -111,7 +111,7 @@ export interface ImportBatch {
   updated_rows: number;
   duplicate_rows: number;
   rejected_rows: number;
-  status: 'pending' | 'processing' | 'completed' | 'failed' | 'partial';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'partial' | 'rolled_back';
   error_summary?: string;
   created_at: string;
   completed_at?: string;
