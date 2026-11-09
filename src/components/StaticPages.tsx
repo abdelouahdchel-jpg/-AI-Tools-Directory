@@ -24,17 +24,49 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
         <h1 className="text-3xl font-bold tracking-tight text-slate-900 mb-4">
           About AI Tools Directory
         </h1>
-        <div className="prose text-sm text-slate-600 leading-relaxed space-y-4">
+        <div className="prose text-sm text-slate-600 leading-relaxed space-y-5">
           <p>
-            AI Tools Directory is an independent, engineer-curated index of artificial intelligence software, models, developer tools, and workflow systems.
+            AI Tools Directory is an independent directory of artificial intelligence software, models, developer tools, and workflow platforms. Our goal is to help users discover and compare AI tools through clear descriptions, transparent pricing information, and reliable source attribution.
           </p>
+
           <h2 className="text-lg font-bold text-slate-900 pt-3">Our Core Principles</h2>
-          <ul className="list-disc pl-5 space-y-2">
-            <li><strong>Zero Fabricated Reviews or Ratings:</strong> We strictly prohibit artificial aggregate ratings, bot reviews, or fake user counters. Tools are evaluated strictly on verified technical specifications and published pricing.</li>
-            <li><strong>Actual Verification:</strong> A tool is only marked "Verified" after human review of its official documentation, terms of service, and company domain.</li>
-            <li><strong>Independent Editorial Independence:</strong> Paid sponsorships and affiliate links never alter search relevance rankings or editorial conclusions.</li>
-            <li><strong>Scale & Performance:</strong> Built with PostgreSQL relational schemas capable of indexing tens of thousands of software tools efficiently.</li>
-          </ul>
+
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">No Fabricated Reviews or Ratings</h3>
+              <p>
+                We do not invent user reviews, aggregate ratings, popularity figures, or usage statistics. Information is presented based on available sources, not fabricated engagement metrics.
+              </p>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Transparent Verification</h3>
+              <p>
+                We distinguish between website availability checks and editorial verification. A successful website check confirms that an official website is reachable; it does not automatically confirm every product feature, pricing detail, or technical claim. Editorial verification requires reviewing relevant official sources.
+              </p>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Independent Editorial Policy</h3>
+              <p>
+                Affiliate links and paid sponsorships do not determine organic search rankings or editorial conclusions. Sponsored placements, when available, are clearly identified.
+              </p>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Source Attribution</h3>
+              <p>
+                We aim to identify official websites and relevant documentation as sources for tool information. Information may change, so users should consult the provider&apos;s official website for the latest features, terms, and pricing.
+              </p>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 mb-1">Scale and Performance</h3>
+              <p>
+                Our directory uses a structured database designed to organize and index a growing catalog of AI tools efficiently.
+              </p>
+            </div>
+          </div>
         </div>
       </div>
     );
