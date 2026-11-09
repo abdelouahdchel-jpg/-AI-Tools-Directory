@@ -140,16 +140,33 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
         <h1 className="text-3xl font-bold tracking-tight text-slate-900 mb-4">
           Affiliate & Commercial Disclosure
         </h1>
-        <div className="prose text-sm text-slate-600 leading-relaxed space-y-4">
+        <div className="prose text-sm text-slate-600 leading-relaxed space-y-5">
           <p>
-            In compliance with FTC guidelines and international transparency standards, please note that AI Tools Directory participates in various affiliate marketing programs.
+            AI Tools Directory may participate in affiliate marketing programs. This means that some links to third-party products and services may be affiliate links. If you click one of these links and make a purchase, we may earn a commission at no additional cost to you.
           </p>
           <p>
-            This means that when you click on certain outbound links to software vendors and purchase a subscription or license, we may receive a commission at no additional cost to you.
+            Not all links are affiliate links, and our participation in affiliate programs may vary depending on the provider.
           </p>
-          <h2 className="text-lg font-bold text-slate-900 pt-3">Editorial Guarantee</h2>
+
+          <h2 className="text-lg font-bold text-slate-900 pt-3">Editorial Independence</h2>
           <p>
-            Affiliate compensation does not influence our evaluation criteria, inclusion decisions, or feature descriptions. Tools without affiliate programs receive identical objective coverage as tools with affiliate agreements. All tools undergo the exact same verification pipeline.
+            Affiliate commissions and commercial relationships do not determine our organic search rankings, editorial descriptions, or tool inclusion decisions.
+          </p>
+          <p>
+            Tools with affiliate partnerships are not automatically ranked higher or given preferential editorial treatment. Tools without affiliate programs can receive the same consideration and coverage.
+          </p>
+
+          <h2 className="text-lg font-bold text-slate-900 pt-3">Verification and Accuracy</h2>
+          <p>
+            We aim to provide accurate descriptions and transparent source attribution. Website availability checks and editorial verification are distinct processes. A successful website check does not guarantee that every product feature, pricing detail, or technical specification has been independently confirmed.
+          </p>
+
+          <h2 className="text-lg font-bold text-slate-900 pt-3">Pricing and Third-Party Websites</h2>
+          <p>
+            Prices, plans, features, and terms may change. Please consult the official provider&apos;s website for the latest information before making a purchase.
+          </p>
+          <p>
+            AI Tools Directory is an independent directory and is not responsible for transactions, services, or policies on third-party websites.
           </p>
         </div>
       </div>
