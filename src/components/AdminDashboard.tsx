@@ -28,7 +28,8 @@ import {
   Crown,
   RotateCcw,
   Sliders,
-  Globe
+  Globe,
+  Sparkles
 } from 'lucide-react';
 import {
   Tool,
@@ -617,10 +618,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
 
   // Download templates
   const downloadCsvTemplate = () => {
+    // 14 standard columns without sample rows as requested
     const csvContent = "data:text/csv;charset=utf-8," + 
-      "name,website_url,short_description,full_description,pricing_type,starting_price,currency,category,data_source,official_source_url,source_license,source_attribution,logo_url,affiliate_url\n" +
-      "Claude,https://claude.ai,Next-gen AI assistant by Anthropic,Claude is a conversational and coding assistant built by Anthropic with 200k context window,freemium,20.00,USD,Coding & Development,manual_editorial,https://anthropic.com/claude,Proprietary,Anthropic Docs,https://api.iconify.design/simple-icons:anthropic.svg,\n" +
-      "Whisper,https://github.com/openai/whisper,Open source speech recognition neural net,Whisper is an automatic speech recognition system trained on 680000 hours of multilingual data,open_source,0.00,USD,Audio & Speech,github_repo,https://github.com/openai/whisper,MIT,OpenAI Whisper Repo,https://api.iconify.design/simple-icons:github.svg,";
+      "name,website_url,short_description,full_description,pricing_type,starting_price,currency,category,data_source,official_source_url,source_license,source_attribution,logo_url,affiliate_url\n";
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
@@ -628,6 +628,50 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  // Load initial_tools_seed.csv (10 real tools) directly into the Bulk Import flow
+  const loadInitialSeedFile = async () => {
+    try {
+      setImportStep('parsing');
+      const response = await fetch('/initial_tools_seed.csv');
+      if (!response.ok) {
+        throw new Error(`Failed to load initial_tools_seed.csv (${response.status})`);
+      }
+      const text = await response.text();
+      const file = new File([text], 'initial_tools_seed.csv', { type: 'text/csv' });
+      setImportFile(file);
+
+      const results = Papa.parse(text, {
+        header: true,
+        skipEmptyLines: true,
+        transformHeader: h => h.trim()
+      });
+      const parsedRows = results.data as Record<string, unknown>[];
+
+      if (!parsedRows || parsedRows.length === 0) {
+        alert('The seed file contains no rows.');
+        setImportStep('idle');
+        return;
+      }
+
+      const colSet = new Set<string>();
+      parsedRows.slice(0, 10).forEach(row => {
+        if (row && typeof row === 'object') {
+          Object.keys(row).forEach(k => colSet.add(k));
+        }
+      });
+      const cols = Array.from(colSet);
+      setDiscoveredColumns(cols);
+      setRawImportRows(parsedRows);
+
+      const mapping = autoDetectMapping(cols);
+      setColumnMapping(mapping);
+      setImportStep('mapping');
+    } catch (err: any) {
+      alert(`Could not load seed file: ${err.message}`);
+      setImportStep('idle');
+    }
   };
 
   const downloadJsonTemplate = () => {
@@ -1410,16 +1454,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite }) 
                   <p className="text-xs text-slate-500 mb-4">
                     Chunked streaming supports up to 10,000 records per file. Maximum file size 25MB.
                   </p>
-                  <label className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors">
-                    <FileSpreadsheet className="w-4 h-4" />
-                    <span>Select Dataset File</span>
-                    <input
-                      type="file"
-                      accept=".csv,.json"
-                      onChange={handleFileChange}
-                      className="hidden"
-                    />
-                  </label>
+                  <div className="flex flex-wrap items-center justify-center gap-3">
+                    <label className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors">
+                      <FileSpreadsheet className="w-4 h-4" />
+                      <span>Select Dataset File</span>
+                      <input
+                        type="file"
+                        accept=".csv,.json"
+                        onChange={handleFileChange}
+                        className="hidden"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={loadInitialSeedFile}
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg cursor-pointer transition-colors"
+                      title="Load the 10 real seed tools (initial_tools_seed.csv) directly"
+                    >
+                      <Sparkles className="w-4 h-4 text-indigo-600" />
+                      <span>Import Seed Tools (10 Records)</span>
+                    </button>
+                  </div>
                 </div>
               )}
 
