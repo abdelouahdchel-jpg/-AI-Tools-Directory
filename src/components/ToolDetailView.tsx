@@ -22,6 +22,7 @@ interface ToolDetailViewProps {
   isCompared: boolean;
   onUpvote: (toolId: string) => void;
   allTools: Tool[];
+  isPreviewMode?: boolean;
 }
 
 export const ToolDetailView: React.FC<ToolDetailViewProps> = ({
@@ -31,7 +32,8 @@ export const ToolDetailView: React.FC<ToolDetailViewProps> = ({
   onToggleCompare,
   isCompared,
   onUpvote,
-  allTools
+  allTools,
+  isPreviewMode = false
 }) => {
   const primaryCategory = tool.categories[0]?.name || 'Artificial Intelligence';
 
@@ -42,6 +44,39 @@ export const ToolDetailView: React.FC<ToolDetailViewProps> = ({
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      {/* Administrator Preview Mode Notice Banner */}
+      {isPreviewMode && (
+        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between gap-4 text-amber-900 shadow-xs">
+          <div className="flex items-center gap-3">
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse shrink-0" />
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-xs uppercase tracking-wider text-amber-800">
+                  Administrator Preview Mode
+                </span>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${
+                  tool.publication_status === 'published'
+                    ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                    : tool.publication_status === 'draft'
+                    ? 'bg-slate-200 text-slate-800 border-slate-300'
+                    : 'bg-amber-100 text-amber-800 border-amber-300'
+                }`}>
+                  Status: {tool.publication_status}
+                </span>
+              </div>
+              <p className="text-xs text-amber-700 mt-0.5">
+                Viewing public detail presentation for {tool.name}. Status remains unmodified and draft tools are not publicly listed.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onBack}
+            className="px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition-colors cursor-pointer shrink-0"
+          >
+            Exit Preview
+          </button>
+        </div>
+      )}
       {/* Breadcrumb Navigation */}
       <nav className="flex items-center gap-2 text-xs text-slate-500 mb-6">
         <button

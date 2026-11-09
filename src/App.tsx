@@ -47,6 +47,7 @@ export default function App() {
 
   const [selectedToolSlug, setSelectedToolSlug] = useState<string | null>(null);
   const [selectedBlogSlug, setSelectedBlogSlug] = useState<string | undefined>(undefined);
+  const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
 
   // Supabase Data Fetching & Sync State
   const [dataFetchState, setDataFetchState] = useState<{
@@ -273,7 +274,20 @@ export default function App() {
 
   // If inside Admin Console, render dedicated admin view
   if (currentView === 'admin') {
-    return <AdminDashboard onBackToSite={() => handleNavigate('home')} />;
+    return (
+      <AdminDashboard
+        onBackToSite={() => {
+          setIsPreviewMode(false);
+          handleNavigate('home');
+        }}
+        onPreviewTool={(tool: Tool) => {
+          setSelectedToolSlug(tool.slug);
+          setIsPreviewMode(true);
+          setCurrentView('tool-detail');
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }}
+      />
+    );
   }
 
   return (
@@ -668,7 +682,14 @@ export default function App() {
         {currentView === 'tool-detail' && currentTool && (
           <ToolDetailView
             tool={currentTool}
-            onBack={() => setCurrentView('all-tools')}
+            onBack={() => {
+              if (isPreviewMode) {
+                setIsPreviewMode(false);
+                handleNavigate('admin');
+              } else {
+                setCurrentView('all-tools');
+              }
+            }}
             onSelectAlternative={(slug) => {
               setSelectedToolSlug(slug);
               window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -677,6 +698,7 @@ export default function App() {
             isCompared={compareList.includes(currentTool.id)}
             onUpvote={handleUpvote}
             allTools={allTools}
+            isPreviewMode={isPreviewMode}
           />
         )}
 
