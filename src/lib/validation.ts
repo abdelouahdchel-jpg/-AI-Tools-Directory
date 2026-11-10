@@ -55,7 +55,10 @@ export const ToolImportRowSchema = z.object({
   short_description: z.string().min(10, 'Short description must be at least 10 characters').max(280),
   full_description: z.string().min(20, 'Full description must be provided'),
   pricing_type: PricingTypeEnum.default('unknown'),
-  starting_price: z.coerce.number().min(0).default(0),
+  starting_price: z.preprocess(
+    val => (val === null || val === undefined || val === '' ? null : Number(val)),
+    z.number().min(0).nullable().optional()
+  ),
   currency: z.string().max(10).default('USD'),
   category: z.string().min(2, 'Category name or slug is required'),
   data_source: z.string().default('csv_import'),

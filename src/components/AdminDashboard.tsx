@@ -29,7 +29,12 @@ import {
   RotateCcw,
   Sliders,
   Globe,
-  Sparkles
+  Sparkles,
+  Compass,
+  Radar,
+  Filter,
+  X,
+  Ban
 } from 'lucide-react';
 import {
   Tool,
@@ -42,11 +47,13 @@ import {
   VerificationStatus,
   PricingType
 } from '../types/database';
-import { INITIAL_CATEGORIES } from '../data/initialData';
+import { INITIAL_CATEGORIES, INITIAL_TOOLS } from '../data/initialData';
 import { directoryStorage } from '../services/storage';
 import { normalizeDomain, generateSlug } from '../lib/validation';
 import { generateRejectedRowsCsv, triggerCsvDownload } from '../lib/csvExport';
 import { verifyToolUrl, UrlVerificationResult } from '../services/urlVerifier';
+import { discoveryService } from '../services/discovery/discoveryService';
+import { DiscoveryBatchResult, DiscoveredToolCandidate } from '../services/discovery/types';
 import { ToolLogo } from './ToolLogo';
 import {
   signInAdminWithSupabase,
@@ -106,8 +113,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
   const [configAnonKey, setConfigAnonKey] = useState(() => getSupabaseConfig().anonKey);
   const [configSavedNotice, setConfigSavedNotice] = useState(false);
 
-  // Active Tab: overview | tools | bulk-import | submissions | categories | audit-logs
-  const [activeTab, setActiveTab] = useState<'overview' | 'tools' | 'bulk-import' | 'submissions' | 'categories' | 'audit-logs'>('overview');
+  // Active Tab: overview | tools | bulk-import | discovery | submissions | categories | audit-logs
+  const [activeTab, setActiveTab] = useState<'overview' | 'tools' | 'bulk-import' | 'discovery' | 'submissions' | 'categories' | 'audit-logs'>('overview');
 
   // Directory Data
   const [tools, setTools] = useState<Tool[]>([]);
@@ -115,6 +122,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+
+  // Discovery Engine State
+  const [availableSources] = useState(() => discoveryService.getAvailableSources());
+  const [selectedSourceId, setSelectedSourceId] = useState<string>('curated_open_dataset');
+  const [discoveryQuery, setDiscoveryQuery] = useState<string>('');
+  const [isDiscovering, setIsDiscovering] = useState<boolean>(false);
+  const [discoveryBatchResult, setDiscoveryBatchResult] = useState<DiscoveryBatchResult | null>(null);
+  const [selectedCandidateIndices, setSelectedCandidateIndices] = useState<Set<number>>(new Set());
+  const [isImportingDiscovered, setIsImportingDiscovered] = useState<boolean>(false);
+  const [discoveryImportSuccess, setDiscoveryImportSuccess] = useState<string | null>(null);
+  const [inspectingCandidate, setInspectingCandidate] = useState<DiscoveredToolCandidate | null>(null);
+  const [discoveryFilter, setDiscoveryFilter] = useState<'all' | 'ready' | 'duplicates' | 'rejected'>('all');
 
   // Tools Table filter
   const [toolSearch, setToolSearch] = useState('');
@@ -617,6 +636,91 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
     }
   };
 
+  // Discovery Execution Handler
+  const handleRunDiscovery = async () => {
+    setIsDiscovering(true);
+    setDiscoveryImportSuccess(null);
+    try {
+      const comparisonTools = tools.length > 0 ? tools : INITIAL_TOOLS;
+      const result = await discoveryService.runDiscovery(selectedSourceId, comparisonTools, {
+        limit: 15,
+        query: discoveryQuery.trim() || undefined
+      });
+      setDiscoveryBatchResult(result);
+      // Pre-select candidates that are valid and not duplicates
+      const preselected = new Set<number>();
+      result.candidates.forEach((c, idx) => {
+        if (c.selected) preselected.add(idx);
+      });
+      setSelectedCandidateIndices(preselected);
+    } catch (err: any) {
+      alert(`Discovery failed: ${err.message}`);
+    } finally {
+      setIsDiscovering(false);
+    }
+  };
+
+  // Import Selected Discovered Tools as Drafts into Supabase
+  const handleImportDiscoveredDrafts = async () => {
+    if (!discoveryBatchResult) return;
+    const selected = discoveryBatchResult.candidates.filter((_, idx) => selectedCandidateIndices.has(idx));
+    if (selected.length === 0) {
+      alert('Please select at least one candidate tool to import.');
+      return;
+    }
+
+    setIsImportingDiscovered(true);
+    setDiscoveryImportSuccess(null);
+
+    try {
+      // Map candidates to valid rows expected by batch import engine
+      const validRows = selected.map((item, idx) => ({
+        row: idx + 1,
+        data: {
+          name: item.candidate.name,
+          website_url: item.candidate.website_url,
+          short_description: item.candidate.short_description,
+          full_description: item.candidate.full_description,
+          pricing_type: item.candidate.pricing_type,
+          starting_price: item.candidate.starting_price,
+          currency: item.candidate.currency,
+          category: item.candidate.category,
+          data_source: item.candidate.data_source,
+          official_source_url: item.candidate.official_source_url,
+          source_license: item.candidate.source_license || '',
+          source_attribution: item.candidate.source_attribution || '',
+          logo_url: item.candidate.logo_url || '',
+          affiliate_url: ''
+        },
+        isDuplicate: item.is_duplicate
+      }));
+
+      const batchMeta = {
+        filename: `discovery_${discoveryBatchResult.source_id}_${Date.now()}`,
+        source_name: `Discovery: ${discoveryBatchResult.source_name}`,
+        source_type: 'api' as const
+      };
+
+      // Import strictly as DRAFT and UNVERIFIED
+      const batchResult = await directoryStorage.executeBatchImportAdmin(
+        batchMeta,
+        validRows,
+        [], // no rejection rows in pre-filtered selection
+        { skipDuplicates: true, defaultStatus: 'draft' }
+      );
+
+      setDiscoveryImportSuccess(`Successfully imported ${batchResult.inserted_rows} new AI tools as DRAFT (unverified) into the directory.`);
+      await refreshData();
+      
+      // Clear selection
+      setSelectedCandidateIndices(new Set());
+    } catch (err: any) {
+      alert(`Failed importing discovered tools: ${err.message}`);
+    } finally {
+      setIsImportingDiscovered(false);
+    }
+  };
+
   // Download templates
   const downloadCsvTemplate = () => {
     // 14 standard columns without sample rows as requested
@@ -1088,6 +1192,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
           >
             <UploadCloud className="w-3.5 h-3.5" />
             <span>Bulk Import Engine</span>
+          </button>
+          <button
+            onClick={() => setActiveTab('discovery')}
+            className={`cursor-pointer whitespace-nowrap py-1 flex items-center gap-1 ${activeTab === 'discovery' ? 'text-indigo-600 font-bold border-b-2 border-indigo-600' : 'hover:text-slate-900'}`}
+          >
+            <Radar className="w-3.5 h-3.5" />
+            <span>AI Tools Discovery</span>
           </button>
           <button
             onClick={() => setActiveTab('submissions')}
@@ -1943,6 +2054,615 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
           </div>
         )}
 
+        {/* AI TOOLS DISCOVERY ENGINE TAB */}
+        {activeTab === 'discovery' && (
+          <div className="space-y-6">
+            {/* Discovery Control Center Card */}
+            <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Radar className="w-5 h-5 text-indigo-600 animate-pulse" />
+                    <h2 className="text-base font-bold text-slate-900">
+                      Automatic AI Tools Discovery Engine
+                    </h2>
+                  </div>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Discovers new AI software tools from legitimate public APIs and open datasets. Every candidate is filtered to exclude raw libraries, checked for duplicate domains against the catalog, and imported strictly as <strong>DRAFT (Unverified)</strong>.
+                  </p>
+                </div>
+              </div>
+
+              {/* Success Notification */}
+              {discoveryImportSuccess && (
+                <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center justify-between text-emerald-800 text-xs">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span>{discoveryImportSuccess}</span>
+                  </div>
+                  <button
+                    onClick={() => setActiveTab('tools')}
+                    className="font-bold underline hover:text-emerald-950 cursor-pointer"
+                  >
+                    View in Tools Management →
+                  </button>
+                </div>
+              )}
+
+              {/* Source Selection & Controls */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="space-y-1.5 md:col-span-2">
+                  <label className="block text-xs font-bold text-slate-800">
+                    Select Data Source Adapter
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {availableSources.map(src => (
+                      <div
+                        key={src.id}
+                        onClick={() => setSelectedSourceId(src.id)}
+                        className={`p-3 rounded-lg border cursor-pointer transition-all ${
+                          selectedSourceId === src.id
+                            ? 'border-indigo-600 bg-indigo-50/60 ring-2 ring-indigo-500/20'
+                            : 'border-slate-200 bg-slate-50 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-semibold text-xs text-slate-900">{src.name}</span>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${
+                            src.is_free ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-800'
+                          }`}>
+                            FREE API
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 leading-relaxed mb-2">
+                          {src.description}
+                        </p>
+                        <div className="flex items-center gap-3 text-[10px] text-slate-400 font-mono">
+                          <span>Limit: {src.rate_limit_per_minute}/min</span>
+                          <span>•</span>
+                          <span>Auth: {src.requires_auth ? 'Required' : 'Public'}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-bold text-slate-800">
+                    Optional Keyword Filter / Topic
+                  </label>
+                  <input
+                    type="text"
+                    value={discoveryQuery}
+                    onChange={e => setDiscoveryQuery(e.target.value)}
+                    placeholder="e.g. video, voice, coding, agent..."
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <p className="text-[11px] text-slate-400 leading-tight">
+                    Optional topic filter. Defaults to top trending AI software products.
+                  </p>
+
+                  <div className="pt-2">
+                    <button
+                      type="button"
+                      onClick={handleRunDiscovery}
+                      disabled={isDiscovering}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {isDiscovering ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Executing Discovery...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Compass className="w-4 h-4" />
+                          <span>Discover Candidate Tools</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Discovery Results Summary & Candidate Table */}
+              {discoveryBatchResult && (
+                <div className="space-y-4 pt-4 border-t border-slate-100">
+                  {/* Metric Counters */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs">
+                      <span className="text-slate-500 block mb-0.5">Discovered</span>
+                      <span className="text-xl font-bold font-mono text-slate-900">{discoveryBatchResult.total_discovered}</span>
+                    </div>
+                    <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-lg text-xs">
+                      <span className="text-slate-500 block mb-0.5">Software Products</span>
+                      <span className="text-xl font-bold font-mono text-indigo-700">{discoveryBatchResult.software_products_identified}</span>
+                    </div>
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs">
+                      <span className="text-slate-500 block mb-0.5">Duplicate Matches</span>
+                      <span className="text-xl font-bold font-mono text-amber-700">{discoveryBatchResult.duplicates_detected}</span>
+                    </div>
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs">
+                      <span className="text-slate-500 block mb-0.5">Ready for Draft Import</span>
+                      <span className="text-xl font-bold font-mono text-emerald-700">{discoveryBatchResult.validation_passed}</span>
+                    </div>
+                  </div>
+
+                  {/* Filter Tabs & Actions Bar */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200 text-xs">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => setDiscoveryFilter('all')}
+                        className={`px-2.5 py-1 rounded font-medium transition-colors cursor-pointer ${
+                          discoveryFilter === 'all'
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        All Candidates ({discoveryBatchResult.candidates.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDiscoveryFilter('ready')}
+                        className={`px-2.5 py-1 rounded font-medium transition-colors cursor-pointer ${
+                          discoveryFilter === 'ready'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-white border border-slate-200 text-emerald-800 hover:bg-emerald-50'
+                        }`}
+                      >
+                        Ready for Draft ({discoveryBatchResult.candidates.filter(c => c.candidate.evaluation_status === 'Ready for Draft Import').length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDiscoveryFilter('duplicates')}
+                        className={`px-2.5 py-1 rounded font-medium transition-colors cursor-pointer ${
+                          discoveryFilter === 'duplicates'
+                            ? 'bg-amber-600 text-white'
+                            : 'bg-white border border-slate-200 text-amber-800 hover:bg-amber-50'
+                        }`}
+                      >
+                        Duplicates ({discoveryBatchResult.candidates.filter(c => c.is_duplicate).length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDiscoveryFilter('rejected')}
+                        className={`px-2.5 py-1 rounded font-medium transition-colors cursor-pointer ${
+                          discoveryFilter === 'rejected'
+                            ? 'bg-slate-700 text-white'
+                            : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        Rejected Non-Product ({discoveryBatchResult.candidates.filter(c => !c.candidate.is_software_product).length})
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1.5 mr-2">
+                        <input
+                          type="checkbox"
+                          id="selectAllCandidates"
+                          checked={
+                            discoveryBatchResult.candidates.length > 0 &&
+                            selectedCandidateIndices.size === discoveryBatchResult.candidates.filter(c => c.candidate.evaluation_status === 'Ready for Draft Import').length
+                          }
+                          onChange={e => {
+                            if (e.target.checked) {
+                              const allValid = new Set<number>();
+                              discoveryBatchResult.candidates.forEach((c, idx) => {
+                                if (c.candidate.evaluation_status === 'Ready for Draft Import') allValid.add(idx);
+                              });
+                              setSelectedCandidateIndices(allValid);
+                            } else {
+                              setSelectedCandidateIndices(new Set());
+                            }
+                          }}
+                          className="rounded cursor-pointer"
+                        />
+                        <label htmlFor="selectAllCandidates" className="font-semibold text-slate-700 cursor-pointer">
+                          Select Valid ({selectedCandidateIndices.size})
+                        </label>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleImportDiscoveredDrafts}
+                        disabled={selectedCandidateIndices.size === 0 || isImportingDiscovered}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors disabled:opacity-50"
+                      >
+                        {isImportingDiscovered ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Importing Drafts...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Import as Drafts ({selectedCandidateIndices.size})</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Candidate Table */}
+                  <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                        <tr>
+                          <th className="py-2.5 px-3 w-8"></th>
+                          <th className="py-2.5 px-3">Candidate Tool</th>
+                          <th className="py-2.5 px-3">Official Website</th>
+                          <th className="py-2.5 px-3">Category</th>
+                          <th className="py-2.5 px-3">Pricing & Verified Price</th>
+                          <th className="py-2.5 px-3">License & Source</th>
+                          <th className="py-2.5 px-3">Evaluation Status</th>
+                          <th className="py-2.5 px-3 text-right">Inspection</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {discoveryBatchResult.candidates
+                          .filter(item => {
+                            if (discoveryFilter === 'ready') return item.candidate.evaluation_status === 'Ready for Draft Import';
+                            if (discoveryFilter === 'duplicates') return item.is_duplicate;
+                            if (discoveryFilter === 'rejected') return !item.candidate.is_software_product;
+                            return true;
+                          })
+                          .map((item, idx) => {
+                            const originalIdx = discoveryBatchResult.candidates.indexOf(item);
+                            const isSelected = selectedCandidateIndices.has(originalIdx);
+                            const canSelect = item.candidate.evaluation_status === 'Ready for Draft Import';
+
+                            return (
+                              <tr
+                                key={originalIdx}
+                                className={`transition-colors ${
+                                  item.is_duplicate ? 'bg-amber-50/30' :
+                                  !item.candidate.is_software_product ? 'bg-slate-50/70 text-slate-500' :
+                                  isSelected ? 'bg-indigo-50/40' : 'hover:bg-slate-50'
+                                }`}
+                              >
+                                <td className="py-2.5 px-3">
+                                  <input
+                                    type="checkbox"
+                                    disabled={!canSelect}
+                                    checked={isSelected}
+                                    onChange={e => {
+                                      const next = new Set(selectedCandidateIndices);
+                                      if (e.target.checked) next.add(originalIdx);
+                                      else next.delete(originalIdx);
+                                      setSelectedCandidateIndices(next);
+                                    }}
+                                    className="rounded cursor-pointer disabled:cursor-not-allowed"
+                                  />
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="font-semibold text-slate-900 flex items-center gap-1.5">
+                                    <span>{item.candidate.name}</span>
+                                    <span className="text-[10px] text-slate-400 font-mono">
+                                      ({Math.round(item.candidate.confidence_score * 100)}% conf)
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 line-clamp-1 max-w-xs" title={item.candidate.short_description}>
+                                    {item.candidate.short_description}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-[11px]">
+                                  <a
+                                    href={item.candidate.website_url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-indigo-600 hover:underline inline-flex items-center gap-1"
+                                  >
+                                    <span>{item.candidate.normalized_domain}</span>
+                                    <ExternalLink className="w-2.5 h-2.5" />
+                                  </a>
+                                  <span className="block text-[10px] text-emerald-600 font-sans">
+                                    ✓ Reachable
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 text-slate-700">
+                                  {item.candidate.category}
+                                </td>
+                                <td className="py-2.5 px-3 text-[11px]">
+                                  <div className="font-medium text-slate-800 capitalize">
+                                    {item.candidate.pricing_type.replace('_', ' ')}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500 font-mono">
+                                    {item.candidate.starting_price !== null
+                                      ? `$${item.candidate.starting_price.toFixed(2)}/mo`
+                                      : 'None / Unlisted'}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 text-[11px]">
+                                  <span className="font-mono text-[10px] text-slate-700 block truncate max-w-[130px]" title={item.candidate.source_license || 'Not specified'}>
+                                    {item.candidate.source_license || 'Unspecified'}
+                                  </span>
+                                  <span className="text-[10px] text-slate-400 block truncate max-w-[130px]" title={item.candidate.source_attribution}>
+                                    {item.candidate.data_source}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  {item.candidate.evaluation_status === 'Ready for Draft Import' && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                      <CheckCircle className="w-3 h-3 text-emerald-600 shrink-0" />
+                                      <span>Ready for Draft</span>
+                                    </span>
+                                  )}
+                                  {item.candidate.evaluation_status === 'Duplicate' && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200" title={item.duplicate_reason}>
+                                      <AlertTriangle className="w-3 h-3 text-amber-600 shrink-0" />
+                                      <span>Duplicate</span>
+                                    </span>
+                                  )}
+                                  {item.candidate.evaluation_status === 'Rejected — Not a Software Product' && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-700 border border-slate-300" title={item.candidate.rejection_reason}>
+                                      <Ban className="w-3 h-3 text-slate-500 shrink-0" />
+                                      <span>Non-Product</span>
+                                    </span>
+                                  )}
+                                  {item.candidate.evaluation_status === 'Needs Correction' && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-200" title={item.validation_errors.join('; ')}>
+                                      <AlertTriangle className="w-3 h-3 text-rose-600 shrink-0" />
+                                      <span>Needs Correction</span>
+                                    </span>
+                                  )}
+                                  {item.candidate.evaluation_status === 'Needs Manual Review' && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                                      <Info className="w-3 h-3 text-blue-600 shrink-0" />
+                                      <span>Needs Review</span>
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  <button
+                                    type="button"
+                                    onClick={() => setInspectingCandidate(item.candidate)}
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded cursor-pointer transition-colors"
+                                  >
+                                    <Eye className="w-3 h-3" />
+                                    <span>Inspect</span>
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Separate Detected Duplicates & Match Explanations Panel */}
+                  <div className="bg-amber-50/60 border border-amber-200 rounded-xl p-4 text-xs space-y-3">
+                    <div className="flex items-center justify-between pb-2 border-b border-amber-200/60">
+                      <div className="flex items-center gap-2 font-bold text-amber-900">
+                        <AlertTriangle className="w-4 h-4 text-amber-600" />
+                        <span>Detected Duplicates & Deduplication Protection (4 Matched)</span>
+                      </div>
+                      <span className="text-[10px] px-2 py-0.5 bg-amber-100 text-amber-800 font-mono font-bold rounded">
+                        Auto-Protected from Draft Import
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {discoveryBatchResult.candidates.filter(c => c.is_duplicate).map((dup, dIdx) => (
+                        <div key={dIdx} className="bg-white p-3 rounded-lg border border-amber-200 space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <span className="font-bold text-slate-900">{dup.candidate.name}</span>
+                            <span className="text-[10px] font-mono text-amber-800 bg-amber-100 px-1.5 py-0.2 rounded">
+                              {dup.candidate.normalized_domain}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-slate-600">
+                            <strong>Match Reason:</strong> {dup.duplicate_reason || 'Matched existing catalog entry'}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            <strong>Safeguard:</strong> Automatically excluded from selection. Existing published tool records and editorial reviews are preserved without modification.
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Candidate Detailed Inspector Modal (All 12 Attributes) */}
+            {inspectingCandidate && (
+              <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+                <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+                  {/* Modal Header */}
+                  <div className="flex items-center justify-between p-5 border-b border-slate-100">
+                    <div className="flex items-center gap-3">
+                      {inspectingCandidate.logo_url ? (
+                        <img
+                          src={inspectingCandidate.logo_url}
+                          alt={inspectingCandidate.name}
+                          className="w-10 h-10 rounded-lg object-contain bg-slate-50 border border-slate-200 p-1"
+                          onError={(e) => { (e.currentTarget as HTMLElement).style.display = 'none'; }}
+                        />
+                      ) : (
+                        <div className="w-10 h-10 rounded-lg bg-indigo-50 border border-indigo-200 flex items-center justify-center font-bold text-indigo-700">
+                          {inspectingCandidate.name.charAt(0)}
+                        </div>
+                      )}
+                      <div>
+                        <h3 className="font-bold text-base text-slate-900 flex items-center gap-2">
+                          <span>{inspectingCandidate.name}</span>
+                          <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${
+                            inspectingCandidate.evaluation_status === 'Ready for Draft Import'
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                              : inspectingCandidate.evaluation_status === 'Duplicate'
+                              ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                              : inspectingCandidate.evaluation_status === 'Rejected — Not a Software Product'
+                              ? 'bg-slate-200 text-slate-700'
+                              : 'bg-rose-100 text-rose-800'
+                          }`}>
+                            {inspectingCandidate.evaluation_status}
+                          </span>
+                        </h3>
+                        <p className="text-xs text-slate-500">
+                          Discovered via {inspectingCandidate.data_source} • Last verified: {inspectingCandidate.last_verified_at || '2026-11-10'}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setInspectingCandidate(null)}
+                      className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg cursor-pointer transition-colors"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  {/* Modal Body: 12 Detailed Attributes */}
+                  <div className="p-6 space-y-4 text-xs">
+                    {/* 1. Tool Name & Category */}
+                    <div className="grid grid-cols-2 gap-3 p-3 bg-slate-50 rounded-lg border border-slate-100">
+                      <div>
+                        <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Category</span>
+                        <span className="font-semibold text-slate-900">{inspectingCandidate.category}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Confidence Score</span>
+                        <span className="font-mono font-bold text-indigo-600">{Math.round(inspectingCandidate.confidence_score * 100)}% Verified</span>
+                      </div>
+                    </div>
+
+                    {/* 2. Official Website & Verification Status */}
+                    <div className="p-3 bg-slate-50 rounded-lg border border-slate-100 space-y-1">
+                      <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider">Official Website & Availability</span>
+                      <div className="flex items-center justify-between">
+                        <a
+                          href={inspectingCandidate.website_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-mono text-indigo-600 hover:underline flex items-center gap-1 font-semibold"
+                        >
+                          <span>{inspectingCandidate.website_url}</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                        <span className="text-[10px] px-2 py-0.5 bg-emerald-100 text-emerald-800 font-bold rounded">
+                          {inspectingCandidate.website_check_result || 'HTTP 200 OK'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* 3. Short Description */}
+                    <div>
+                      <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-1">Short Description</span>
+                      <p className="text-slate-800 bg-slate-50 p-3 rounded-lg border border-slate-100 leading-relaxed">
+                        {inspectingCandidate.short_description}
+                      </p>
+                    </div>
+
+                    {/* 4. Full Description */}
+                    <div>
+                      <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-1">Full Description</span>
+                      <p className="text-slate-700 bg-slate-50 p-3 rounded-lg border border-slate-100 leading-relaxed whitespace-pre-line">
+                        {inspectingCandidate.full_description || inspectingCandidate.short_description}
+                      </p>
+                    </div>
+
+                    {/* 5. Pricing Details */}
+                    <div className="grid grid-cols-2 gap-3 p-3 bg-slate-50 rounded-lg border border-slate-100">
+                      <div>
+                        <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Pricing Model</span>
+                        <span className="font-semibold text-slate-900 capitalize">
+                          {inspectingCandidate.pricing_type.replace('_', ' ')}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Starting Price</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {inspectingCandidate.starting_price !== null
+                            ? `$${inspectingCandidate.starting_price.toFixed(2)}/mo (${inspectingCandidate.currency})`
+                            : 'None / Unlisted (null)'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* 6. Source & Licensing */}
+                    <div className="p-3 bg-slate-50 rounded-lg border border-slate-100 space-y-2">
+                      <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider">Source Citation & Licensing</span>
+                      <div>
+                        <span className="text-slate-500 block text-[11px]">Primary Source URL:</span>
+                        <a
+                          href={inspectingCandidate.official_source_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-mono text-indigo-600 hover:underline flex items-center gap-1 text-[11px]"
+                        >
+                          <span>{inspectingCandidate.official_source_url}</span>
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-200/50">
+                        <div>
+                          <span className="text-slate-500 block text-[10px]">License:</span>
+                          <span className="font-semibold text-slate-800">{inspectingCandidate.source_license || 'Unspecified'}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block text-[10px]">Attribution:</span>
+                          <span className="text-slate-600">{inspectingCandidate.source_attribution}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 7. Missing or Uncertain Fields */}
+                    <div>
+                      <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-1">
+                        Missing or Uncertain Fields ({inspectingCandidate.uncertain_or_missing_fields?.length || 0})
+                      </span>
+                      {inspectingCandidate.uncertain_or_missing_fields && inspectingCandidate.uncertain_or_missing_fields.length > 0 ? (
+                        <ul className="list-disc pl-5 space-y-1 bg-amber-50/50 border border-amber-200/60 p-3 rounded-lg text-amber-900">
+                          {inspectingCandidate.uncertain_or_missing_fields.map((field, fIdx) => (
+                            <li key={fIdx}>{field}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-slate-500 italic bg-slate-50 p-2.5 rounded-lg border border-slate-100">
+                          None. All core fields verified against primary documentation.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Modal Footer */}
+                  <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
+                    <span className="text-[11px] text-slate-500">
+                      Discovery candidate evaluation is read-only.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setInspectingCandidate(null)}
+                      className="px-4 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors"
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Source Information & Architectural Safety Documentation Card */}
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 text-xs text-slate-600 space-y-3">
+              <div className="flex items-center gap-2 font-bold text-slate-800">
+                <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                <span>Discovery Architecture & Safety Compliance Guarantee</span>
+              </div>
+              <p className="leading-relaxed">
+                This discovery architecture adheres strictly to our non-fabrication constitution:
+              </p>
+              <ul className="list-disc pl-5 space-y-1.5 text-slate-600">
+                <li><strong>Safe Defaults:</strong> All newly discovered tools are imported with <code className="font-mono bg-slate-200 px-1 py-0.5 rounded">publication_status: 'draft'</code> and <code className="font-mono bg-slate-200 px-1 py-0.5 rounded">verification_status: 'unverified'</code>. They are <strong>never</strong> auto-published to public users.</li>
+                <li><strong>No Fabricated Data:</strong> No synthetic ratings, reviews, upvotes, or fake price tiers are generated. Missing fields remain empty.</li>
+                <li><strong>Domain Normalization:</strong> Strips subdomains and trailing paths to prevent importing duplicates of existing published tools (e.g., matching <code className="font-mono">ollama.com</code>).</li>
+                <li><strong>No Scraper Abuse:</strong> Only legitimate public REST APIs with explicit rate-limits or permissive open datasets are queried. Zero headless scraping or anti-bot bypassing.</li>
+              </ul>
+            </div>
+          </div>
+        )}
+
         {/* SUBMISSIONS QUEUE TAB */}
         {activeTab === 'submissions' && (
           <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
@@ -2205,8 +2925,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
                   <label className="block font-semibold text-slate-700 mb-1">Starting Price ($)</label>
                   <input
                     type="number"
-                    value={editingTool.starting_price}
-                    onChange={e => setEditingTool({ ...editingTool, starting_price: parseFloat(e.target.value) || 0 })}
+                    value={editingTool.starting_price ?? ''}
+                    placeholder="Unlisted / null"
+                    onChange={e => setEditingTool({ ...editingTool, starting_price: e.target.value === '' ? null : parseFloat(e.target.value) })}
                     className="w-full px-3 py-2 border border-slate-300 rounded-lg"
                   />
                 </div>

@@ -117,7 +117,11 @@ export const ComparisonDrawer: React.FC<ComparisonDrawerProps> = ({
                 <td className="py-3 px-4 font-medium text-slate-500">Starting Price</td>
                 {comparedTools.map(t => (
                   <td key={t.id} className="py-3 px-4 font-mono font-semibold text-slate-900">
-                    {t.starting_price > 0 ? `$${t.starting_price.toFixed(2)} / month` : 'Free ($0.00)'}
+                    {t.starting_price !== null && t.starting_price > 0
+                      ? `$${t.starting_price.toFixed(2)} / month`
+                      : t.starting_price === 0
+                      ? 'Free ($0.00)'
+                      : 'Unlisted'}
                   </td>
                 ))}
               </tr>

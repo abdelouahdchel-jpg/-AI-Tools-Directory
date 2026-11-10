@@ -52,7 +52,7 @@ export interface Tool {
   full_description: string;
   logo_url: string;
   pricing_type: PricingType;
-  starting_price: number;
+  starting_price: number | null;
   currency: string;
   affiliate_url?: string;
   official_source_url?: string;

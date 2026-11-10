@@ -520,7 +520,7 @@ class DirectoryStorageService {
         result.sort((a, b) => b.name.localeCompare(a.name));
         break;
       case 'price-asc':
-        result.sort((a, b) => a.starting_price - b.starting_price);
+        result.sort((a, b) => (a.starting_price ?? 0) - (b.starting_price ?? 0));
         break;
       default:
         result.sort((a, b) => (b.featured ? 1 : 0) - (a.featured ? 1 : 0));
@@ -1398,7 +1398,7 @@ class DirectoryStorageService {
   }
 
   public executeBatchImport(
-    batchMeta: { filename: string; source_name: string; source_type: 'csv' | 'json' },
+    batchMeta: { filename: string; source_name: string; source_type: 'csv' | 'json' | 'api' | 'manual' },
     validRows: Array<{ row: number; data: ReturnType<typeof ToolImportRowSchema.parse>; isDuplicate: boolean }>,
     errors: Array<{ row: number; error_code: string; message: string; original_data: Record<string, unknown> }>,
     options: { skipDuplicates: boolean; defaultStatus: 'draft' | 'pending' } = { skipDuplicates: true, defaultStatus: 'draft' }
@@ -1441,7 +1441,7 @@ class DirectoryStorageService {
         full_description: d.full_description,
         logo_url: d.logo_url || '',
         pricing_type: d.pricing_type as PricingType,
-        starting_price: d.starting_price,
+        starting_price: d.starting_price ?? null,
         currency: d.currency,
         affiliate_url: d.affiliate_url,
         official_source_url: d.official_source_url || d.website_url,
@@ -1510,7 +1510,7 @@ class DirectoryStorageService {
   }
 
   public async executeBatchImportAdmin(
-    batchMeta: { filename: string; source_name: string; source_type: 'csv' | 'json' },
+    batchMeta: { filename: string; source_name: string; source_type: 'csv' | 'json' | 'api' | 'manual' },
     validRows: Array<{ row: number; data: ReturnType<typeof ToolImportRowSchema.parse>; isDuplicate: boolean }>,
     errors: Array<{ row: number; error_code: string; message: string; original_data: Record<string, unknown> }>,
     options: { skipDuplicates: boolean; defaultStatus: 'draft' | 'pending' } = { skipDuplicates: true, defaultStatus: 'draft' }

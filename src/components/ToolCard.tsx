@@ -28,9 +28,9 @@ export const ToolCard: React.FC<ToolCardProps> = ({
       case 'open_source':
         return 'Open Source';
       case 'freemium':
-        return tool.starting_price > 0 ? `Freemium (from $${tool.starting_price}/mo)` : 'Freemium';
+        return tool.starting_price !== null && tool.starting_price > 0 ? `Freemium (from $${tool.starting_price}/mo)` : 'Freemium';
       case 'paid':
-        return `Paid (from $${tool.starting_price}/mo)`;
+        return tool.starting_price !== null ? `Paid (from $${tool.starting_price}/mo)` : 'Paid';
       case 'free_trial':
         return 'Free Trial';
       default:

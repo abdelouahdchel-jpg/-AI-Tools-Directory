@@ -128,7 +128,7 @@ export const ToolDetailView: React.FC<ToolDetailViewProps> = ({
                 <span aria-hidden="true">·</span>
                 <span className="capitalize font-mono">{tool.pricing_type.replace('_', ' ')}</span>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono">{tool.starting_price > 0 ? `From $${tool.starting_price}/mo` : 'Free Tier Available'}</span>
+                <span className="font-mono">{tool.starting_price !== null && tool.starting_price > 0 ? `From $${tool.starting_price}/mo` : tool.starting_price === 0 ? 'Free Tier Available' : 'Pricing Unlisted'}</span>
                 {tool.last_verified_at && (
                   <>
                     <span aria-hidden="true">·</span>
