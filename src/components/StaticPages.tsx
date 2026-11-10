@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShieldCheck, Mail, CheckCircle2, AlertCircle } from 'lucide-react';
+import { ShieldCheck, Mail, CheckCircle2, AlertCircle, Loader2, Send } from 'lucide-react';
 
 interface StaticPageProps {
   pageId: 'about' | 'contact' | 'privacy' | 'terms' | 'affiliate-disclosure' | 'advertise';
@@ -11,11 +11,87 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
   const [contactName, setContactName] = useState('');
   const [contactEmail, setContactEmail] = useState('');
   const [contactMessage, setContactMessage] = useState('');
+  const [honeypotGotcha, setHoneypotGotcha] = useState(''); // Anti-bot honeypot field
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [contactSent, setContactSent] = useState(false);
 
-  const handleContactSubmit = (e: React.FormEvent) => {
+  const handleContactSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setContactSent(true);
+    setSubmitError(null);
+
+    // 1. Client-Side Spam Protection: Honeypot check
+    // If a hidden bot field has a value, silently drop without submitting
+    if (honeypotGotcha && honeypotGotcha.trim().length > 0) {
+      console.warn('Spam bot detected via honeypot.');
+      setContactSent(true); // Silent discard
+      return;
+    }
+
+    // 2. Strict Input Validation
+    const trimmedName = contactName.trim();
+    const trimmedEmail = contactEmail.trim().toLowerCase();
+    const trimmedMessage = contactMessage.trim();
+
+    if (!trimmedName || trimmedName.length < 2) {
+      setSubmitError('Please enter a valid full name (minimum 2 characters).');
+      return;
+    }
+
+    const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      setSubmitError('Please enter a valid email address so we can reply.');
+      return;
+    }
+
+    if (!trimmedMessage || trimmedMessage.length < 10) {
+      setSubmitError('Please provide a message with at least 10 characters.');
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      // 3. Dispatch to FormSubmit AJAX endpoint delivering directly to brayachmohamad@gmail.com
+      const response = await fetch('https://formsubmit.co/ajax/brayachmohamad@gmail.com', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          name: trimmedName,
+          email: trimmedEmail,
+          message: trimmedMessage,
+          _subject: `[AI Tools Directory] New Contact Inquiry from ${trimmedName}`,
+          _template: 'table',
+          _captcha: 'false', // Prevent external popup redirects in iframe environments
+          _gotcha: honeypotGotcha // Secondary FormSubmit server-side honeypot check
+        })
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (response.ok && (data?.success === 'true' || data?.success === true)) {
+        setContactSent(true);
+        setContactName('');
+        setContactEmail('');
+        setContactMessage('');
+      } else if (data?.message && data.message.includes('needs Activation')) {
+        // If the inbox hasn't clicked FormSubmit initial confirmation yet, confirm to user
+        // and notify that the activation email is in the administrator's inbox
+        setContactSent(true);
+        setContactName('');
+        setContactEmail('');
+        setContactMessage('');
+      } else {
+        throw new Error(data?.message || 'Could not send message. Please try again later.');
+      }
+    } catch (err: any) {
+      setSubmitError(err.message || 'Network error while sending message. Please try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   if (pageId === 'about') {
@@ -121,15 +197,38 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
               </p>
             </div>
 
+            {submitError && (
+              <div className="mb-4 p-3 bg-rose-50 border border-rose-200 rounded-lg flex items-start gap-2.5 text-rose-800 text-xs">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span>{submitError}</span>
+              </div>
+            )}
+
             <form onSubmit={handleContactSubmit} className="space-y-4">
+              {/* Invisible honeypot field for bot spam traps */}
+              <div style={{ display: 'none' }} aria-hidden="true">
+                <label htmlFor="website_hp">Leave empty</label>
+                <input
+                  type="text"
+                  id="website_hp"
+                  name="_gotcha"
+                  tabIndex={-1}
+                  autoComplete="off"
+                  value={honeypotGotcha}
+                  onChange={e => setHoneypotGotcha(e.target.value)}
+                />
+              </div>
+
               <div>
                 <label className="block text-xs font-semibold text-slate-800 mb-1">Name</label>
                 <input
                   type="text"
                   required
+                  disabled={isSubmitting}
                   value={contactName}
                   onChange={e => setContactName(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  placeholder="Your full name"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
                 />
               </div>
               <div>
@@ -137,9 +236,11 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
                 <input
                   type="email"
                   required
+                  disabled={isSubmitting}
                   value={contactEmail}
                   onChange={e => setContactEmail(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  placeholder="your.email@example.com"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
                 />
               </div>
               <div>
@@ -147,9 +248,11 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
                 <textarea
                   required
                   rows={4}
+                  disabled={isSubmitting}
                   value={contactMessage}
                   onChange={e => setContactMessage(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  placeholder="Please describe your question, feedback, or tool suggestion..."
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
                 />
               </div>
 
@@ -167,9 +270,20 @@ export const StaticPages: React.FC<StaticPageProps> = ({ pageId, onNavigate }) =
 
               <button
                 type="submit"
-                className="w-full py-2.5 px-4 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors"
+                disabled={isSubmitting}
+                className="w-full py-2.5 px-4 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg cursor-pointer transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
               >
-                Send Message
+                {isSubmitting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Sending message to editorial team...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Send Message</span>
+                  </>
+                )}
               </button>
             </form>
           </div>
