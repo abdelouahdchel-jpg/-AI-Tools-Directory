@@ -1,0 +1,41 @@
+name: Automated AI Tools Discovery & Ingestion
+
+on:
+  schedule:
+    # Runs daily at 03:00 UTC (07:00 Gulf Standard Time / 23:00 EST)
+    - cron: '0 3 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-tools-discovery
+  cancel-in-progress: false
+
+jobs:
+  discover-and-ingest:
+    name: Discover & Ingest Draft Tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci || npm install
+
+      - name: Execute Discovery & Ingestion
+        env:
+          # Secrets configured in GitHub Repository Settings -> Secrets and variables -> Actions
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx tsx scripts/run_automated_discovery.ts

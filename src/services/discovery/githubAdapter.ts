@@ -29,17 +29,28 @@ export function classifySoftwareProduct(item: {
     }
   }
 
-  // Positive indicators: must have an official standalone homepage (not github alone) or app keywords
+  // Positive indicators: MUST have an official standalone homepage (not github.com)
   const productKeywords = [
     'app', 'tool', 'editor', 'workspace', 'assistant', 'platform', 'generator',
     'interface', 'gui', 'desktop', 'web app', 'extension', 'agent', 'dashboard'
   ];
 
-  const hasProductKeyword = productKeywords.some(kw => desc.includes(kw) || topics.includes(kw) || name.includes(kw));
-  const hasExternalHomepage = Boolean(item.homepage && item.homepage.startsWith('http') && !item.homepage.includes('github.com'));
+  const hasExternalHomepage = Boolean(
+    item.homepage &&
+    item.homepage.trim().startsWith('http') &&
+    !item.homepage.toLowerCase().includes('github.com')
+  );
 
-  if (!hasExternalHomepage && !hasProductKeyword) {
-    return { is_product: false, reason: 'Lacks external standalone product homepage or application keywords' };
+  if (!hasExternalHomepage) {
+    return {
+      is_product: false,
+      reason: 'Lacks standalone official website; GitHub repository URL cannot substitute for an official product website.'
+    };
+  }
+
+  const hasProductKeyword = productKeywords.some(kw => desc.includes(kw) || topics.includes(kw) || name.includes(kw));
+  if (!hasProductKeyword) {
+    return { is_product: false, reason: 'Lacks software product application keywords in description/topics' };
   }
 
   return { is_product: true };
@@ -47,13 +58,13 @@ export function classifySoftwareProduct(item: {
 
 /**
  * Adapter for GitHub Public Search API
- * Focuses on legitimate open-source AI applications and GUI products.
+ * Focuses on legitimate open-source AI applications with standalone official websites.
  */
 export class GitHubAiToolsAdapter implements SourceAdapter {
   public metadata: DiscoverySourceMetadata = {
     id: 'github_public_api',
     name: 'GitHub AI Applications (Public API)',
-    description: 'Searches public GitHub repositories tagged with AI application topics and active product homepages.',
+    description: 'Searches public GitHub repositories with standalone official product homepages and verified software products.',
     type: 'public_api',
     homepage_url: 'https://github.com',
     is_free: true,
@@ -71,12 +82,18 @@ export class GitHubAiToolsAdapter implements SourceAdapter {
     const candidates: DiscoveredToolCandidate[] = [];
 
     try {
-      const res = await fetch(endpoint, {
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'AIScoutDirectory-Discovery/1.0 (+https://aiscout.directory)'
-        }
-      });
+      const headers: Record<string, string> = {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'AIScoutDirectory-Discovery/1.0 (+https://aiscout.directory)'
+      };
+
+      // Use GITHUB_TOKEN if provided via environment / GitHub Secrets for higher rate limit
+      const envToken = typeof process !== 'undefined' && process.env?.GITHUB_TOKEN;
+      if (envToken) {
+        headers['Authorization'] = `Bearer ${envToken}`;
+      }
+
+      const res = await fetch(endpoint, { headers });
 
       if (!res.ok) {
         console.warn(`GitHub discovery returned HTTP ${res.status}`);
@@ -87,13 +104,21 @@ export class GitHubAiToolsAdapter implements SourceAdapter {
       const items = data.items || [];
 
       for (const item of items) {
-        const homepage = item.homepage && item.homepage.trim().startsWith('http') ? item.homepage.trim() : item.html_url;
+        const hasExternalHomepage = Boolean(
+          item.homepage &&
+          item.homepage.trim().startsWith('http') &&
+          !item.homepage.toLowerCase().includes('github.com')
+        );
+
         const classification = classifySoftwareProduct({
           name: item.name,
           description: item.description || '',
           homepage: item.homepage,
           topics: item.topics
         });
+
+        // If repo lacks external homepage, official website does not exist - reject per Requirement 3
+        const standaloneWebsite = hasExternalHomepage ? item.homepage.trim() : '';
 
         // Infer primary category
         let category = 'Coding & Development';
@@ -107,13 +132,13 @@ export class GitHubAiToolsAdapter implements SourceAdapter {
         // Calculate confidence score
         let score = 0.5;
         if (classification.is_product) score += 0.3;
-        if (item.homepage && !item.homepage.includes('github.com')) score += 0.15;
+        if (hasExternalHomepage) score += 0.15;
         if (item.stargazers_count > 1000) score += 0.05;
 
         candidates.push({
           name: item.name.replace(/[-_]/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-          website_url: homepage,
-          normalized_domain: normalizeDomain(homepage),
+          website_url: standaloneWebsite || item.html_url,
+          normalized_domain: standaloneWebsite ? normalizeDomain(standaloneWebsite) : 'github.com',
           short_description: (item.description || 'Open-source artificial intelligence application.').slice(0, 250),
           full_description: `${item.description || ''}\n\nOpen-source AI software repository maintained by ${item.owner?.login || 'the community'}. Stargazers: ${item.stargazers_count}. License: ${item.license?.spdx_id || 'Open Source'}.`,
           category,
@@ -130,7 +155,7 @@ export class GitHubAiToolsAdapter implements SourceAdapter {
           is_software_product: classification.is_product,
           rejection_reason: classification.reason,
           evaluation_status: classification.is_product ? 'Ready for Draft Import' : 'Rejected — Not a Software Product',
-          website_check_result: 'Discovered via GitHub API endpoint',
+          website_check_result: hasExternalHomepage ? 'Reachable external product homepage' : 'No standalone product website (GitHub repo only)',
           uncertain_or_missing_fields: ['Commercial pricing (unlisted)']
         });
       }

@@ -1589,6 +1589,14 @@ class DirectoryStorageService {
                 is_primary: true
               });
             }
+          } else if (insertErr) {
+            console.error(`Supabase insert failed for tool "${d.name}":`, insertErr);
+            errors.push({
+              row: item.row,
+              error_code: insertErr.code || 'SUPABASE_INSERT_ERROR',
+              message: insertErr.message || `Failed saving tool "${d.name}" to Supabase database`,
+              original_data: { name: d.name, website_url: d.website_url, details: insertErr.message }
+            });
           }
         }
 
@@ -1605,8 +1613,9 @@ class DirectoryStorageService {
 
         const finalStatus = errors.length > 0 && inserted > 0 ? 'partial' : errors.length > 0 ? 'failed' : 'completed';
         const batchSummaryPayload = JSON.stringify({
-          summary: errors.length > 0 ? `${errors.length} validation errors encountered` : 'Completed successfully',
-          created_tool_ids: insertedToolIds
+          summary: errors.length > 0 ? `${errors.length} errors encountered during import` : 'Completed successfully',
+          created_tool_ids: insertedToolIds,
+          error_messages: errors.map(e => `${e.error_code}: ${e.message}`)
         });
 
         const { data: finalBatch } = await client
@@ -1631,9 +1640,17 @@ class DirectoryStorageService {
           created_tool_ids: insertedToolIds
         });
 
+        // If all rows failed, throw explicit error so the UI does not report false success
+        if (inserted === 0 && validRows.length > 0) {
+          const firstErr = errors[0]?.message || 'Unknown database rejection';
+          throw new Error(`All ${validRows.length} tools failed to save in Supabase: ${firstErr}`);
+        }
+
         return finalBatch as ImportBatch;
-      } catch (e) {
-        console.warn('Supabase bulk import failed, falling back to local storage:', e);
+      } catch (e: any) {
+        console.error('Supabase bulk import failed:', e);
+        // Requirement 1: Do NOT claim success if saving in Supabase fails
+        throw new Error(`Supabase import failed: ${e.message || 'Database connection or permission error'}`);
       }
     }
 

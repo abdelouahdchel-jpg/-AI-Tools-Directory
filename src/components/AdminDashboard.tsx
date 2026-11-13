@@ -34,7 +34,9 @@ import {
   Radar,
   Filter,
   X,
-  Ban
+  Ban,
+  Clock,
+  Activity
 } from 'lucide-react';
 import {
   Tool,
@@ -709,13 +711,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
         { skipDuplicates: true, defaultStatus: 'draft' }
       );
 
-      setDiscoveryImportSuccess(`Successfully imported ${batchResult.inserted_rows} new AI tools as DRAFT (unverified) into the directory.`);
+      if (batchResult.inserted_rows > 0) {
+        const errorPart = batchResult.rejected_rows > 0 ? ` (${batchResult.rejected_rows} failed to insert - check error logs)` : '';
+        setDiscoveryImportSuccess(`Successfully imported ${batchResult.inserted_rows} new AI tools as DRAFT (unverified) into the directory.${errorPart}`);
+      } else {
+        alert(`No tools were saved into Supabase: ${batchResult.error_summary || 'All items failed validation or insertion'}`);
+      }
       await refreshData();
       
       // Clear selection
       setSelectedCandidateIndices(new Set());
     } catch (err: any) {
-      alert(`Failed importing discovered tools: ${err.message}`);
+      alert(`Failed importing discovered tools into Supabase: ${err.message}`);
     } finally {
       setIsImportingDiscovered(false);
     }
@@ -2069,6 +2076,51 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
                   </div>
                   <p className="text-xs text-slate-600 mt-1">
                     Discovers new AI software tools from legitimate public APIs and open datasets. Every candidate is filtered to exclude raw libraries, checked for duplicate domains against the catalog, and imported strictly as <strong>DRAFT (Unverified)</strong>.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    <Activity className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Automated Runner Active</span>
+                  </span>
+                </div>
+              </div>
+
+              {/* GitHub Actions Schedule & System Status Bar */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200 text-xs">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5 text-slate-500 font-medium">
+                    <Clock className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>Automated Discovery Schedule</span>
+                  </div>
+                  <div className="font-bold text-slate-900">Daily at 03:00 UTC</div>
+                  <p className="text-[11px] text-slate-500">
+                    Next run: Tomorrow 03:00 UTC • Workflow: <code className="font-mono text-[10px]">ai_tools_discovery.yml</code>
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5 text-slate-500 font-medium">
+                    <Activity className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>URL Health Audit Schedule</span>
+                  </div>
+                  <div className="font-bold text-slate-900">Weekly every Sunday at 04:00 UTC</div>
+                  <p className="text-[11px] text-slate-500">
+                    Read-only audit: Zero tools deleted or altered • <code className="font-mono text-[10px]">verify_tool_health.yml</code>
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5 text-slate-500 font-medium">
+                    <ShieldCheck className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>Latest Batch Status</span>
+                  </div>
+                  <div className="font-bold text-slate-900 truncate">
+                    {batches.find(b => b.source_type === 'api' || b.source_name.toLowerCase().includes('discovery'))?.source_name || 'Scheduled background agent'}
+                  </div>
+                  <p className="text-[11px] text-slate-500">
+                    Total Drafts in Queue: {tools.filter(t => t.publication_status === 'draft').length} • Published: {tools.filter(t => t.publication_status === 'published').length}
                   </p>
                 </div>
               </div>

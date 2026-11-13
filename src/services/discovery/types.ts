@@ -38,7 +38,7 @@ export interface DiscoverySourceMetadata {
   id: string;
   name: string;
   description: string;
-  type: 'public_api' | 'open_dataset' | 'curated_feed';
+  type: 'public_api' | 'open_dataset' | 'curated_feed' | 'rss_feed';
   homepage_url: string;
   is_free: boolean;
   requires_auth: boolean;
