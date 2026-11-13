@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { discoveryService } from '../src/services/discovery/discoveryService';
+import { discoveryService, matchesExistingToolRecord } from '../src/services/discovery/discoveryService';
 import { preflightCheckUrl } from '../src/services/urlVerifier';
 import { ToolImportRowSchema, normalizeDomain, generateSlug } from '../src/lib/validation';
 import { INITIAL_TOOLS } from '../src/data/initialData';
 import { CuratedOpenDatasetAdapter } from '../src/services/discovery/curatedDatasetAdapter';
 import { GitHubAiToolsAdapter } from '../src/services/discovery/githubAdapter';
 import { HuggingFaceSpacesAdapter } from '../src/services/discovery/huggingFaceAdapter';
-import { PublicRssFeedAdapter } from '../src/services/discovery/rssAdapter';
+import { PublicRssFeedAdapter, classifyRssEntry } from '../src/services/discovery/rssAdapter';
 
 async function runComprehensiveTests() {
   console.log('===============================================================');
@@ -249,6 +249,124 @@ async function runComprehensiveTests() {
   const round2Batch = await discoveryService.runDiscovery('curated_open_dataset', simulatedToolsAfterRound1, { limit: 15 });
   const round2NewValid = round2Batch.candidates.filter(c => c.candidate.evaluation_status === 'Ready for Draft Import' && !c.is_duplicate);
   assert(round2NewValid.length === 0, 'Re-running discovery against ingested tools produces 0 new duplicates (100% idempotency)');
+
+  // -------------------------------------------------------------
+  // Test 11: Shared-Platform Deduplication Regression (Hugging Face)
+  // -------------------------------------------------------------
+  console.log('\n--- Test Suite 11: Shared-Platform Deduplication Regression ---');
+  const existingDeepsite = {
+    name: 'Deepsite',
+    slug: 'deepsite',
+    website_url: 'https://huggingface.co/spaces/enzostvs/deepsite',
+    normalized_domain: 'huggingface.co'
+  };
+
+  // A. Distinct HF Space sharing huggingface.co MUST NOT match Deepsite
+  const distinctHfTool = {
+    name: 'Ai Comic Factory',
+    website_url: 'https://huggingface.co/spaces/jbilcke-hf/ai-comic-factory',
+    normalized_domain: 'huggingface.co'
+  };
+  const hfDistinctCheck = matchesExistingToolRecord(distinctHfTool, existingDeepsite);
+  assert(!hfDistinctCheck.matched, 'Distinct Hugging Face tool (Ai Comic Factory) is NOT falsely flagged as duplicate of Deepsite');
+
+  // B. Same HF Space appearing twice (even with trailing slash) MUST match as duplicate
+  const sameHfTool = {
+    name: 'Deepsite',
+    website_url: 'https://huggingface.co/spaces/enzostvs/deepsite/',
+    normalized_domain: 'huggingface.co'
+  };
+  const hfSameCheck = matchesExistingToolRecord(sameHfTool, existingDeepsite);
+  assert(hfSameCheck.matched, 'Same Hugging Face tool appearing twice is caught as a duplicate');
+
+  // C. Independent domain deduplication MUST STILL block domain collisions
+  const existingCursor = {
+    name: 'Cursor',
+    slug: 'cursor',
+    website_url: 'https://cursor.com',
+    normalized_domain: 'cursor.com'
+  };
+  const sameDomainDiffPath = {
+    name: 'Cursor IDE Pro',
+    website_url: 'https://www.cursor.com/features',
+    normalized_domain: 'cursor.com'
+  };
+  const independentDomainCheck = matchesExistingToolRecord(sameDomainDiffPath, existingCursor);
+  assert(independentDomainCheck.matched, 'Independent domain collision (cursor.com) is still blocked as duplicate');
+
+  // D. End-to-end discoveryService check with Deepsite already in catalog
+  const catalogWithDeepsite = [
+    ...INITIAL_TOOLS,
+    {
+      ...INITIAL_TOOLS[0],
+      id: 'tool-deepsite',
+      name: 'Deepsite',
+      slug: 'deepsite',
+      website_url: 'https://huggingface.co/spaces/enzostvs/deepsite',
+      normalized_domain: 'huggingface.co',
+      publication_status: 'draft' as const,
+      verification_status: 'unverified' as const
+    }
+  ];
+  const hfBatch = await discoveryService.runDiscovery('huggingface_spaces', catalogWithDeepsite, { limit: 5 });
+  if (hfBatch.total_discovered > 1) {
+    const nonDuplicateHfReady = hfBatch.candidates.filter(
+      c => !c.is_duplicate && c.candidate.evaluation_status === 'Ready for Draft Import'
+    );
+    assert(nonDuplicateHfReady.length >= 1, `Other Hugging Face Spaces remain Ready for Draft Import alongside Deepsite (found: ${nonDuplicateHfReady.length})`);
+  }
+
+  // -------------------------------------------------------------
+  // Test 12: RSS Blog & Research Exclusion Regression
+  // -------------------------------------------------------------
+  console.log('\n--- Test Suite 12: RSS Blog & Research Filtering ---');
+  const blogBenchmark = classifyRssEntry({
+    title: 'CWE-bench v2: More coverage, quality, and transparency',
+    link: 'https://huggingface.co/blog/cwe-bench',
+    description: 'An updated security benchmark evaluating LLM code generation.'
+  });
+  assert(!blogBenchmark.is_product, 'Excludes Hugging Face blog benchmark article from software products');
+
+  const releaseNotesPost = classifyRssEntry({
+    title: 'Apertus 1.5 Release Notes',
+    link: 'https://huggingface.co/blog/swiss-ai/apertus-v15-release-notes',
+    description: 'Technical release notes and weights summary for Apertus 1.5.'
+  });
+  assert(!releaseNotesPost.is_product, 'Excludes release notes blog post from software products');
+
+  const researchModelBlog = classifyRssEntry({
+    title: 'Welcome Beam: a 501B open model you can own, customize, and scale',
+    link: 'https://huggingface.co/blog/reflection-beam',
+    description: 'Research announcement for an open-weights 501B parameter model.'
+  });
+  assert(!researchModelBlog.is_product, 'Excludes open-model research announcement blog post');
+
+  const customerStoryPost = classifyRssEntry({
+    title: 'How Amplitude ships product improvements in 1–2 days with OpenAI',
+    link: 'https://openai.com/business/customer-stories/amplitude',
+    description: 'Customer story about using AI tools internally.'
+  });
+  assert(!customerStoryPost.is_product, 'Excludes customer story article from software products');
+
+  const academyGuidePost = classifyRssEntry({
+    title: 'A Practical Guide to Building AI Agents',
+    link: 'https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents',
+    description: 'Guide for teams building agent workflows.'
+  });
+  assert(!academyGuidePost.is_product, 'Excludes practical guide article from software products');
+
+  const realHfHostedProduct = classifyRssEntry({
+    title: 'Deepsite AI App Builder',
+    link: 'https://huggingface.co/spaces/enzostvs/deepsite',
+    description: 'Interactive web application builder hosted on Hugging Face Spaces.'
+  });
+  assert(realHfHostedProduct.is_product, 'Preserves genuine interactive software product hosted on Hugging Face Spaces');
+
+  const liveRssCheck = await rssAdapter.discover({ limit: 10 });
+  const anyEditorialInLiveRss = liveRssCheck.some(c =>
+    /\/(blog|news|research|academy|customer-stories|customers|guides|learn|business)\//i.test(c.website_url)
+  );
+  assert(!anyEditorialInLiveRss, 'Live RSS adapter output contains zero blog, news, research, customer story, or guide URLs');
 
   console.log('\n===============================================================');
   console.log(`🎉 ALL ${passedTests}/${totalTests} TESTS PASSED WITH 100% SUCCESS!`);

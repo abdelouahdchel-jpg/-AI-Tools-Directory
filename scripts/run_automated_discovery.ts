@@ -1,5 +1,9 @@
 import { createClient } from '@supabase/supabase-js';
-import { discoveryService } from '../src/services/discovery/discoveryService';
+import {
+  discoveryService,
+  SHARED_PLATFORM_DOMAINS,
+  matchesExistingToolRecord
+} from '../src/services/discovery/discoveryService';
 import { extractPageMetadata } from '../src/services/discovery/metadataExtractor';
 import { generateSlug, normalizeDomain } from '../src/lib/validation';
 import { INITIAL_TOOLS } from '../src/data/initialData';
@@ -163,17 +167,60 @@ async function runAutomatedDiscovery() {
 
     for (const cand of candidatesToImport) {
       const slug = generateSlug(cand.name);
-      const domain = cand.normalized_domain || normalizeDomain(cand.website_url);
+      const domain = (cand.normalized_domain || normalizeDomain(cand.website_url)).toLowerCase().trim();
+      const isSharedPlatform = SHARED_PLATFORM_DOMAINS.has(domain);
 
-      // Final pre-insert duplicate check against live database
-      const { data: existingCheck } = await supabaseClient
-        .from('tools')
-        .select('id, name')
-        .or(`slug.eq.${slug},normalized_domain.eq.${domain}`)
-        .limit(1);
+      // Final pre-insert duplicate check against live database:
+      // - On shared multi-tenant platforms (huggingface.co, hf.space, github.com, etc.),
+      //   do NOT treat normalized_domain alone as a duplicate; compare slug, name, and website_url.
+      // - On independent domains, preserve strict normalized_domain + slug + website_url deduplication.
+      let matchedExisting: { id: string; name: string; reason: string } | null = null;
 
-      if (existingCheck && existingCheck.length > 0) {
-        console.log(`   ⏭️  Skipping "${cand.name}" (matched live record: ${existingCheck[0].name})`);
+      if (isSharedPlatform) {
+        const { data: sharedCandidates } = await supabaseClient
+          .from('tools')
+          .select('id, name, slug, website_url, normalized_domain')
+          .or(`slug.eq.${slug},normalized_domain.eq.${domain}`);
+
+        if (sharedCandidates && sharedCandidates.length > 0) {
+          for (const row of sharedCandidates) {
+            const check = matchesExistingToolRecord(
+              { name: cand.name, website_url: cand.website_url, normalized_domain: domain },
+              row
+            );
+            if (check.matched) {
+              matchedExisting = {
+                id: row.id,
+                name: row.name,
+                reason: check.reason || 'Matched unique product URL or slug on shared platform'
+              };
+              break;
+            }
+          }
+        }
+      } else {
+        const { data: existingCheck } = await supabaseClient
+          .from('tools')
+          .select('id, name, slug, website_url, normalized_domain')
+          .or(`slug.eq.${slug},normalized_domain.eq.${domain}`)
+          .limit(5);
+
+        if (existingCheck && existingCheck.length > 0) {
+          const firstMatch = existingCheck[0];
+          const check = matchesExistingToolRecord(
+            { name: cand.name, website_url: cand.website_url, normalized_domain: domain },
+            firstMatch
+          );
+          matchedExisting = {
+            id: firstMatch.id,
+            name: firstMatch.name,
+            reason: check.reason || `Independent domain/slug collision (${domain})`
+          };
+        }
+      }
+
+      if (matchedExisting) {
+        console.log(`   ⏭️  Skipping "${cand.name}" (matched live record: ${matchedExisting.name} — ${matchedExisting.reason})`);
         report.duplicates_detected++;
         continue;
       }

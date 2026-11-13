@@ -47,6 +47,80 @@ function parseRssXml(xmlText: string): RssItem[] {
 }
 
 /**
+ * Classifies whether an RSS/Atom entry represents a standalone software product
+ * (including interactive apps hosted on Hugging Face Spaces) rather than a
+ * blog post, news article, benchmark, release note, or research paper announcement.
+ */
+export function classifyRssEntry(item: {
+  title: string;
+  link: string;
+  description?: string;
+}): { is_product: boolean; reason?: string } {
+  const title = (item.title || '').trim();
+  const desc = (item.description || '').trim();
+  const link = (item.link || '').trim();
+  const lowerText = `${title} ${desc}`.toLowerCase();
+
+  let parsedUrl: URL | null = null;
+  try {
+    parsedUrl = new URL(link);
+  } catch {
+    return { is_product: false, reason: 'Invalid or missing entry URL' };
+  }
+
+  const host = parsedUrl.hostname.toLowerCase().replace(/^www\./, '');
+  const path = parsedUrl.pathname.toLowerCase();
+
+  // Explicitly allow Hugging Face Spaces interactive apps (never reject solely for being on Hugging Face)
+  const isHfSpace = (host === 'huggingface.co' && path.startsWith('/spaces/')) || host.endsWith('.hf.space');
+
+  // Exclude editorial blog, news, research paper, changelog, customer stories, guides, academy, and press URLs
+  const editorialPathPattern = /\/(blog|news|articles?|posts?|press|changelog|release-notes|research|papers?|stories|customer-stories|customers|insights|updates|index|academy|guides?(?:-and-resources)?|learn|tutorials?|docs|ads|business|policy|safety)\b/i;
+  if (!isHfSpace && (editorialPathPattern.test(path) || host === 'arxiv.org' || host.endsWith('.arxiv.org'))) {
+    return {
+      is_product: false,
+      reason: 'Editorial blog, news, guide, customer story, or research article URL rather than a standalone software product'
+    };
+  }
+
+  // Reject raw GitHub repositories without standalone product homepages
+  if (host === 'github.com' && !host.endsWith('.github.io')) {
+    return {
+      is_product: false,
+      reason: 'GitHub repository link is not a standalone product website'
+    };
+  }
+
+  // Exclude research announcements, benchmarks, model weight releases, guides, tutorials, and editorial titles
+  const nonProductContentPatterns = [
+    /\b(release notes|changelog|weekly digest|roundup|newsletter|case study|customer story|technical report|whitepaper|survey|benchmark|cwe-bench|evaluation suite|leaderboard paper)\b/i,
+    /\b(integration contracts|model weights|checkpoints|weights only|arxiv|research paper|preprint)\b/i,
+    /\b(teaching a .* model|open models? (for|you can)|[0-9]+b (open )?model)\b/i,
+    /\b(look it up|how we built|why we|behind the scenes|announcing our partnership|practical guide|guide to|tutorial|academy|how .* ships|turns .* into|using .* across|delegate work to)\b/i
+  ];
+
+  for (const pattern of nonProductContentPatterns) {
+    if (pattern.test(title) || pattern.test(desc)) {
+      return {
+        is_product: false,
+        reason: `Research, benchmark, guide, or editorial article (${pattern.source})`
+      };
+    }
+  }
+
+  // Must carry positive software product/application signals
+  const productSignals = /\b(app|tool|software|platform|editor|studio|workspace|assistant|agent|generator|web app|desktop app|cli|extension|interactive)\b/i;
+  if (!isHfSpace && !productSignals.test(lowerText)) {
+    return {
+      is_product: false,
+      reason: 'Lacks clear standalone software product or interactive application indicators'
+    };
+  }
+
+  return { is_product: true };
+}
+
+/**
  * Adapter for Public AI Product & Software RSS/Atom Feeds
  * Ingests new AI software releases from legitimate public technical feeds.
  */
@@ -96,13 +170,16 @@ export class PublicRssFeedAdapter implements SourceAdapter {
         for (const item of items) {
           if (candidates.length >= limit) break;
 
-          // Filter for tool / software / model announcements
           const title = item.title;
           const text = `${title} ${item.description}`.toLowerCase();
 
-          // Only consider entries that announce an actual software product, app, model, or platform
-          const isToolAnnouncement = /\b(app|tool|model|release|introducing|platform|agent|editor|studio|v\d+(\.\d+)*)\b/i.test(title);
-          if (!isToolAnnouncement) continue;
+          // Exclude editorial blog posts, news, benchmarks, and research announcements
+          const classification = classifyRssEntry({
+            title: item.title,
+            link: item.link,
+            description: item.description
+          });
+          if (!classification.is_product) continue;
 
           // Categorize
           let category = 'Productivity & Workflows';

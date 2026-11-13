@@ -9,7 +9,7 @@ import { Tool } from '../../types/database';
 /**
  * Normalizes a URL for robust deduplication comparison
  */
-function cleanUrlForDedup(rawUrl: string): string {
+export function cleanUrlForDedup(rawUrl: string): string {
   try {
     let trimmed = rawUrl.trim().toLowerCase();
     if (!trimmed.startsWith('http')) trimmed = 'https://' + trimmed;
@@ -25,7 +25,7 @@ function cleanUrlForDedup(rawUrl: string): string {
  * For these platforms, we check path/full URL and tool name/slug, rather than treating
  * the root domain alone as a duplicate collision.
  */
-const SHARED_PLATFORM_DOMAINS = new Set([
+export const SHARED_PLATFORM_DOMAINS = new Set([
   'github.com',
   'huggingface.co',
   'hf.space',
@@ -34,6 +34,37 @@ const SHARED_PLATFORM_DOMAINS = new Set([
   'vercel.app',
   'netlify.app'
 ]);
+
+/**
+ * Checks whether a candidate matches an existing tool record while respecting
+ * multi-tenant shared platforms (e.g. huggingface.co).
+ * - On shared platforms: matches by normalized website_url, slug, or name (NEVER domain alone).
+ * - On independent domains: matches by normalized_domain, slug, name, or normalized website_url.
+ */
+export function matchesExistingToolRecord(
+  candidate: { name: string; website_url: string; normalized_domain?: string },
+  existing: { name: string; slug: string; website_url: string; normalized_domain: string }
+): { matched: boolean; reason?: string } {
+  const domain = (candidate.normalized_domain || normalizeDomain(candidate.website_url)).toLowerCase().trim();
+  const slug = generateSlug(candidate.name).toLowerCase().trim();
+  const nameKey = candidate.name.toLowerCase().trim();
+  const cleanUrl = cleanUrlForDedup(candidate.website_url);
+  const isSharedPlatform = SHARED_PLATFORM_DOMAINS.has(domain);
+
+  if (!isSharedPlatform && existing.normalized_domain.toLowerCase().trim() === domain) {
+    return { matched: true, reason: `Domain '${domain}' already cataloged in directory` };
+  }
+  if (existing.slug.toLowerCase().trim() === slug) {
+    return { matched: true, reason: `Slug '${slug}' already exists in directory` };
+  }
+  if (existing.name.toLowerCase().trim() === nameKey) {
+    return { matched: true, reason: `Tool name '${candidate.name}' already cataloged in directory` };
+  }
+  if (cleanUrlForDedup(existing.website_url) === cleanUrl) {
+    return { matched: true, reason: `URL '${candidate.website_url}' already cataloged in directory` };
+  }
+  return { matched: false };
+}
 
 /**
  * Discovery Engine Coordinator
@@ -229,13 +260,45 @@ export class DiscoveryService {
     options?: { limitPerSource?: number }
   ): Promise<DiscoveryBatchResult[]> {
     const results: DiscoveryBatchResult[] = [];
+    const accumulatedTools: Tool[] = [...existingTools];
+
     for (const adapter of this.adapters.values()) {
       if (!adapter.metadata.enabled) continue;
       try {
-        const result = await this.runDiscovery(adapter.metadata.id, existingTools, {
+        const result = await this.runDiscovery(adapter.metadata.id, accumulatedTools, {
           limit: options?.limitPerSource || 10
         });
         results.push(result);
+
+        // Track approved candidates across sources in the same run so cross-adapter duplicates are caught
+        for (const item of result.candidates) {
+          if (item.candidate.evaluation_status === 'Ready for Draft Import' && !item.is_duplicate) {
+            const c = item.candidate;
+            accumulatedTools.push({
+              id: `batch-${generateSlug(c.name)}`,
+              name: c.name,
+              slug: generateSlug(c.name),
+              website_url: c.website_url,
+              normalized_domain: c.normalized_domain || normalizeDomain(c.website_url),
+              short_description: c.short_description,
+              full_description: c.full_description,
+              logo_url: c.logo_url || '',
+              pricing_type: c.pricing_type,
+              starting_price: c.starting_price,
+              currency: c.currency,
+              data_source: c.data_source,
+              verification_status: 'unverified',
+              publication_status: 'draft',
+              featured: false,
+              sponsored: false,
+              upvotes: 0,
+              views_count: 0,
+              categories: [],
+              created_at: c.discovered_at,
+              updated_at: c.discovered_at
+            });
+          }
+        }
       } catch (err) {
         console.warn(`Discovery failed for adapter ${adapter.metadata.id}:`, err);
       }
