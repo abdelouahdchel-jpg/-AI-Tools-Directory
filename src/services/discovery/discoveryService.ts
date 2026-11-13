@@ -38,8 +38,10 @@ export const SHARED_PLATFORM_DOMAINS = new Set([
 /**
  * Checks whether a candidate matches an existing tool record while respecting
  * multi-tenant shared platforms (e.g. huggingface.co).
- * - On shared platforms: matches by normalized website_url, slug, or name (NEVER domain alone).
- * - On independent domains: matches by normalized_domain, slug, name, or normalized website_url.
+ * - On shared platforms: never match by domain, name, or slug independently of the URL;
+ *   only treat as duplicate when the normalized full URL matches (so distinct projects
+ *   on huggingface.co with the same short name/slug are not falsely excluded).
+ * - On independent domains: preserve strict matching by normalized_domain, URL, slug, or name.
  */
 export function matchesExistingToolRecord(
   candidate: { name: string; website_url: string; normalized_domain?: string },
@@ -51,17 +53,38 @@ export function matchesExistingToolRecord(
   const cleanUrl = cleanUrlForDedup(candidate.website_url);
   const isSharedPlatform = SHARED_PLATFORM_DOMAINS.has(domain);
 
-  if (!isSharedPlatform && existing.normalized_domain.toLowerCase().trim() === domain) {
+  const existingDomain = existing.normalized_domain.toLowerCase().trim();
+  const existingSlug = existing.slug.toLowerCase().trim();
+  const existingName = existing.name.toLowerCase().trim();
+  const existingCleanUrl = cleanUrlForDedup(existing.website_url);
+
+  if (isSharedPlatform) {
+    if (existingCleanUrl === cleanUrl) {
+      if (existingSlug === slug || existingName === nameKey) {
+        return {
+          matched: true,
+          reason: `Shared-platform URL '${candidate.website_url}' and tool identity already cataloged in directory`
+        };
+      }
+      return {
+        matched: true,
+        reason: `URL '${candidate.website_url}' already cataloged in directory`
+      };
+    }
+    return { matched: false };
+  }
+
+  if (existingDomain === domain) {
     return { matched: true, reason: `Domain '${domain}' already cataloged in directory` };
   }
-  if (existing.slug.toLowerCase().trim() === slug) {
+  if (existingCleanUrl === cleanUrl) {
+    return { matched: true, reason: `URL '${candidate.website_url}' already cataloged in directory` };
+  }
+  if (existingSlug === slug) {
     return { matched: true, reason: `Slug '${slug}' already exists in directory` };
   }
-  if (existing.name.toLowerCase().trim() === nameKey) {
+  if (existingName === nameKey) {
     return { matched: true, reason: `Tool name '${candidate.name}' already cataloged in directory` };
-  }
-  if (cleanUrlForDedup(existing.website_url) === cleanUrl) {
-    return { matched: true, reason: `URL '${candidate.website_url}' already cataloged in directory` };
   }
   return { matched: false };
 }
@@ -104,17 +127,13 @@ export class DiscoveryService {
 
     const rawCandidates = await adapter.discover(options);
 
-    // Existing indices for deduplication
-    const existingDomains = new Set(existingTools.map(t => t.normalized_domain.toLowerCase().trim()));
-    const existingNames = new Set(existingTools.map(t => t.name.toLowerCase().trim()));
-    const existingSlugs = new Set(existingTools.map(t => t.slug.toLowerCase().trim()));
-    const existingUrls = new Set(existingTools.map(t => cleanUrlForDedup(t.website_url)));
-
-    // Intra-batch deduplication sets
-    const seenInBatchDomains = new Set<string>();
-    const seenInBatchNames = new Set<string>();
-    const seenInBatchSlugs = new Set<string>();
-    const seenInBatchUrls = new Set<string>();
+    // Intra-batch deduplication records checked with the same shared-platform-aware matcher
+    const seenInBatchRecords: Array<{
+      name: string;
+      slug: string;
+      website_url: string;
+      normalized_domain: string;
+    }> = [];
 
     let softwareProductsCount = 0;
     let nonProductsCount = 0;
@@ -139,52 +158,50 @@ export class DiscoveryService {
         nonProductsCount++;
       }
 
-      // 2. Requirement 2: Enhanced Duplicate Detection (Domain, Name, Slug, Full URL + Intra-batch)
-      const domain = candidate.normalized_domain || normalizeDomain(candidate.website_url);
-      const nameKey = candidate.name.toLowerCase().trim();
+      // 2. Requirement 2: Unified Duplicate Detection via matchesExistingToolRecord (DB + Intra-batch)
+      const domain = (candidate.normalized_domain || normalizeDomain(candidate.website_url)).toLowerCase().trim();
       const slug = generateSlug(candidate.name).toLowerCase().trim();
-      const cleanUrl = cleanUrlForDedup(candidate.website_url);
-      const isSharedPlatform = SHARED_PLATFORM_DOMAINS.has(domain);
 
       let isDuplicate = false;
       let duplicateReason: string | undefined;
 
-      // A. Check against database
-      if (!isSharedPlatform && existingDomains.has(domain)) {
-        isDuplicate = true;
-        duplicateReason = `Domain '${domain}' already cataloged in directory`;
-      } else if (existingNames.has(nameKey)) {
-        isDuplicate = true;
-        duplicateReason = `Tool name '${candidate.name}' already cataloged in directory`;
-      } else if (existingSlugs.has(slug)) {
-        isDuplicate = true;
-        duplicateReason = `Slug '${slug}' already exists in directory`;
-      } else if (existingUrls.has(cleanUrl)) {
-        isDuplicate = true;
-        duplicateReason = `URL '${candidate.website_url}' already cataloged in directory`;
+      // A. Check against existing directory / database tools (and previous adapters via runAllSources)
+      for (const existing of existingTools) {
+        const match = matchesExistingToolRecord(
+          { name: candidate.name, website_url: candidate.website_url, normalized_domain: domain },
+          existing
+        );
+        if (match.matched) {
+          isDuplicate = true;
+          duplicateReason = match.reason;
+          break;
+        }
       }
+
       // B. Check within the same batch (intra-batch deduplication)
-      else if (!isSharedPlatform && seenInBatchDomains.has(domain)) {
-        isDuplicate = true;
-        duplicateReason = `Duplicate domain '${domain}' within current discovery batch`;
-      } else if (seenInBatchNames.has(nameKey)) {
-        isDuplicate = true;
-        duplicateReason = `Duplicate tool name '${candidate.name}' within current discovery batch`;
-      } else if (seenInBatchSlugs.has(slug)) {
-        isDuplicate = true;
-        duplicateReason = `Duplicate slug '${slug}' within current discovery batch`;
-      } else if (seenInBatchUrls.has(cleanUrl)) {
-        isDuplicate = true;
-        duplicateReason = `Duplicate URL within current discovery batch`;
+      if (!isDuplicate) {
+        for (const seen of seenInBatchRecords) {
+          const match = matchesExistingToolRecord(
+            { name: candidate.name, website_url: candidate.website_url, normalized_domain: domain },
+            seen
+          );
+          if (match.matched) {
+            isDuplicate = true;
+            duplicateReason = `${match.reason} (within current discovery batch)`;
+            break;
+          }
+        }
       }
 
       if (isDuplicate) {
         duplicatesCount++;
       } else {
-        if (!isSharedPlatform) seenInBatchDomains.add(domain);
-        seenInBatchNames.add(nameKey);
-        seenInBatchSlugs.add(slug);
-        seenInBatchUrls.add(cleanUrl);
+        seenInBatchRecords.push({
+          name: candidate.name,
+          slug,
+          website_url: candidate.website_url,
+          normalized_domain: domain
+        });
       }
 
       // 3. Schema validation check against ToolImportRowSchema
