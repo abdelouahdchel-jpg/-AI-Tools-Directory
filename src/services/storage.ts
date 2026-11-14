@@ -612,88 +612,88 @@ class DirectoryStorageService {
   public async fetchAdminTools(): Promise<Tool[]> {
     const client = getSupabase();
     if (!client || !isSupabaseConfigured()) {
-      return [...this.tools];
+      throw new Error('Supabase is not configured. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
     }
 
-    try {
-      const { data: toolsData, error: toolsError } = await client
-        .from('tools')
-        .select('*')
-        .order('created_at', { ascending: false });
+    const { data: toolsData, error: toolsError } = await client
+      .from('tools')
+      .select('*')
+      .order('created_at', { ascending: false });
 
-      if (toolsError) throw toolsError;
+    if (toolsError) throw toolsError;
 
-      const { data: categoriesData, error: catError } = await client
-        .from('categories')
-        .select('*')
-        .order('display_order', { ascending: true });
+    const { data: categoriesData, error: catError } = await client
+      .from('categories')
+      .select('*')
+      .order('display_order', { ascending: true });
 
-      if (catError) throw catError;
+    if (catError) throw catError;
 
-      const rawTools = toolsData || [];
-      const rawCategories: Category[] = categoriesData || [];
-      const toolIds = rawTools.map((t: any) => t.id);
+    const rawTools = toolsData || [];
+    const rawCategories: Category[] = categoriesData || [];
+    const toolIds = rawTools.map((t: any) => t.id);
 
-      const toolCategoriesMap: Record<string, string[]> = {};
-      if (toolIds.length > 0) {
-        const { data: tcData } = await client
-          .from('tool_categories')
-          .select('tool_id, category_id')
-          .in('tool_id', toolIds);
+    const toolCategoriesMap: Record<string, string[]> = {};
+    if (toolIds.length > 0) {
+      const { data: tcData, error: tcError } = await client
+        .from('tool_categories')
+        .select('tool_id, category_id')
+        .in('tool_id', toolIds);
 
-        if (tcData) {
-          tcData.forEach((tc: any) => {
-            if (!toolCategoriesMap[tc.tool_id]) toolCategoriesMap[tc.tool_id] = [];
-            toolCategoriesMap[tc.tool_id].push(tc.category_id);
-          });
-        }
+      if (tcError) {
+        console.warn('Failed to fetch tool_categories from Supabase:', tcError);
+      } else if (tcData) {
+        tcData.forEach((tc: any) => {
+          if (!toolCategoriesMap[tc.tool_id]) toolCategoriesMap[tc.tool_id] = [];
+          toolCategoriesMap[tc.tool_id].push(tc.category_id);
+        });
       }
-
-      const mappedTools: Tool[] = rawTools.map((row: any) => {
-        const assignedCatIds = toolCategoriesMap[row.id] || [];
-        const toolCats = rawCategories.filter(c => assignedCatIds.includes(c.id));
-
-        return {
-          id: row.id,
-          name: row.name,
-          slug: row.slug,
-          website_url: row.website_url,
-          normalized_domain: row.normalized_domain || '',
-          short_description: row.short_description || '',
-          full_description: row.full_description || row.short_description || '',
-          logo_url: row.logo_url || '',
-          pricing_type: row.pricing_type || 'unknown',
-          starting_price: Number(row.starting_price) || 0,
-          currency: row.currency || 'USD',
-          affiliate_url: row.affiliate_url || '',
-          official_source_url: row.official_source_url || row.website_url,
-          data_source: row.data_source || 'supabase',
-          source_license: row.source_license || '',
-          source_attribution: row.source_attribution || '',
-          verification_status: row.verification_status || 'unverified',
-          publication_status: row.publication_status || 'draft',
-          featured: Boolean(row.featured),
-          sponsored: Boolean(row.sponsored),
-          sponsored_until: row.sponsored_until,
-          upvotes: Number(row.upvotes) || 0,
-          views_count: Number(row.views_count) || 0,
-          categories: toolCats.length > 0 ? toolCats : (rawCategories.slice(0, 1) || []),
-          last_verified_at: row.last_verified_at,
-          created_at: row.created_at,
-          updated_at: row.updated_at
-        };
-      });
-
-      this.tools = mappedTools;
-      if (rawCategories.length > 0) {
-        this.categories = rawCategories;
-      }
-      this.saveTools();
-      return mappedTools;
-    } catch (err) {
-      console.warn('Failed to fetch tools from Supabase, falling back to local:', err);
-      return [...this.tools];
     }
+
+    const mappedTools: Tool[] = rawTools.map((row: any) => {
+      const assignedCatIds = toolCategoriesMap[row.id] || [];
+      const toolCats = rawCategories.filter(c => assignedCatIds.includes(c.id));
+
+      return {
+        id: row.id,
+        name: row.name,
+        slug: row.slug,
+        website_url: row.website_url,
+        normalized_domain: row.normalized_domain || '',
+        short_description: row.short_description || '',
+        full_description: row.full_description || row.short_description || '',
+        logo_url: row.logo_url || '',
+        pricing_type: row.pricing_type || 'unknown',
+        starting_price:
+          row.starting_price !== null && row.starting_price !== undefined
+            ? Number(row.starting_price)
+            : null,
+        currency: row.currency || 'USD',
+        affiliate_url: row.affiliate_url || '',
+        official_source_url: row.official_source_url || row.website_url,
+        data_source: row.data_source || 'supabase',
+        source_license: row.source_license || '',
+        source_attribution: row.source_attribution || '',
+        verification_status: row.verification_status || 'unverified',
+        publication_status: row.publication_status || 'draft',
+        featured: Boolean(row.featured),
+        sponsored: Boolean(row.sponsored),
+        sponsored_until: row.sponsored_until,
+        upvotes: Number(row.upvotes) || 0,
+        views_count: Number(row.views_count) || 0,
+        categories: toolCats.length > 0 ? toolCats : (rawCategories.slice(0, 1) || []),
+        last_verified_at: row.last_verified_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at
+      };
+    });
+
+    this.tools = mappedTools;
+    if (rawCategories.length > 0) {
+      this.categories = rawCategories;
+    }
+    this.saveTools();
+    return mappedTools;
   }
 
   /**

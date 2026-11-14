@@ -1085,14 +1085,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
 
   // Filter tools for admin table
   const filteredTools = tools.filter(t => {
+    const q = toolSearch.toLowerCase();
     const matchSearch =
-      t.name.toLowerCase().includes(toolSearch.toLowerCase()) ||
-      t.normalized_domain.toLowerCase().includes(toolSearch.toLowerCase());
+      (t.name || '').toLowerCase().includes(q) ||
+      (t.normalized_domain || '').toLowerCase().includes(q);
     const matchStatus = toolStatusFilter === 'all' || t.publication_status === toolStatusFilter;
     return matchSearch && matchStatus;
   });
 
   const isConfigured = isSupabaseConfigured();
+  const activeSupabaseHost = (() => {
+    try {
+      const cfgUrl = getSupabaseConfig().url;
+      return cfgUrl ? new URL(cfgUrl).hostname : '';
+    } catch {
+      return '';
+    }
+  })();
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col">
@@ -1143,10 +1152,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
                   ? 'bg-emerald-950/60 border-emerald-800 text-emerald-400 hover:bg-emerald-900/60'
                   : 'bg-amber-950/60 border-amber-800 text-amber-400 hover:bg-amber-900/60'
               }`}
-              title="Click to view or edit Supabase configuration"
+              title={activeSupabaseHost ? `Connected Supabase project: ${activeSupabaseHost}` : 'Click to view or edit Supabase configuration'}
             >
               <span className={`w-1.5 h-1.5 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-              <span>{isConfigured ? 'Supabase Auth' : 'Config Required'}</span>
+              <span>{isConfigured ? (activeSupabaseHost || 'Supabase Auth') : 'Config Required'}</span>
             </button>
 
             {/* Refresh Live Button */}
