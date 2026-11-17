@@ -5,9 +5,15 @@ import { preflightCheckUrl } from '../src/services/urlVerifier';
 import { ToolImportRowSchema, normalizeDomain, generateSlug } from '../src/lib/validation';
 import { INITIAL_TOOLS } from '../src/data/initialData';
 import { CuratedOpenDatasetAdapter } from '../src/services/discovery/curatedDatasetAdapter';
-import { GitHubAiToolsAdapter } from '../src/services/discovery/githubAdapter';
-import { HuggingFaceSpacesAdapter } from '../src/services/discovery/huggingFaceAdapter';
+import { GitHubAiToolsAdapter, classifySoftwareProduct } from '../src/services/discovery/githubAdapter';
+import { HuggingFaceSpacesAdapter, classifyHuggingFaceSpace } from '../src/services/discovery/huggingFaceAdapter';
 import { PublicRssFeedAdapter, classifyRssEntry } from '../src/services/discovery/rssAdapter';
+import {
+  resolveExecutionMode,
+  resolveCategoryId,
+  resolveSafeUniqueSlug,
+  verifyLiveWebsiteReachability
+} from './run_automated_discovery';
 
 async function runComprehensiveTests() {
   console.log('===============================================================');
@@ -367,6 +373,91 @@ async function runComprehensiveTests() {
     /\/(blog|news|research|academy|customer-stories|customers|guides|learn|business)\//i.test(c.website_url)
   );
   assert(!anyEditorialInLiveRss, 'Live RSS adapter output contains zero blog, news, research, customer story, or guide URLs');
+
+  // -------------------------------------------------------------
+  // Test 13: Execution Mode (DRY-RUN vs Live No-Op) Regression
+  // -------------------------------------------------------------
+  console.log('\n--- Test Suite 13: Execution Mode (DRY-RUN vs Live No-Op) ---');
+  assert(
+    resolveExecutionMode({ isLiveSupabase: true, hasClient: true, candidateCount: 0, dryRunFlag: false }) === 'live_noop',
+    'Live Supabase connection with 0 new candidates resolves to "live_noop" (NOT dry_run)'
+  );
+  assert(
+    resolveExecutionMode({ isLiveSupabase: true, hasClient: true, candidateCount: 4, dryRunFlag: false }) === 'live_insert',
+    'Live Supabase connection with >=1 eligible candidates resolves to "live_insert"'
+  );
+  assert(
+    resolveExecutionMode({ isLiveSupabase: false, hasClient: false, candidateCount: 4, dryRunFlag: false }) === 'dry_run',
+    'Missing Supabase credentials resolves to "dry_run"'
+  );
+  assert(
+    resolveExecutionMode({ isLiveSupabase: true, hasClient: true, candidateCount: 4, dryRunFlag: true }) === 'dry_run',
+    'Explicit --dry-run flag enforces "dry_run" even with Supabase credentials'
+  );
+
+  // -------------------------------------------------------------
+  // Test 14: Leaderboards, Benchmarks, Playbooks & Datasets Exclusion
+  // -------------------------------------------------------------
+  console.log('\n--- Test Suite 14: Non-Product HF & GitHub Exclusion ---');
+  assert(!classifyHuggingFaceSpace({ id: 'open-llm-leaderboard/open_llm_leaderboard' }).is_product, 'Excludes HF open_llm_leaderboard');
+  assert(!classifyHuggingFaceSpace({ id: 'mteb/leaderboard' }).is_product, 'Excludes HF mteb/leaderboard');
+  assert(!classifyHuggingFaceSpace({ id: 'joelniklaus/harness-leaderboard' }).is_product, 'Excludes HF harness-leaderboard');
+  assert(!classifyHuggingFaceSpace({ id: 'nanotron/ultrascale-playbook' }).is_product, 'Excludes HF ultrascale-playbook');
+  assert(!classifyHuggingFaceSpace({ id: 'huggingface/moe-blogpost' }).is_product, 'Excludes HF moe-blogpost');
+  assert(!classifyHuggingFaceSpace({ id: 'allenai/safety-benchmark-dataset', tags: ['dataset'] }).is_product, 'Excludes HF dataset spaces');
+  assert(classifyHuggingFaceSpace({ id: 'enzostvs/deepsite', title: 'DeepSite', shortDescription: 'AI app builder' }).is_product, 'Preserves genuine HF app (Deepsite)');
+
+  assert(
+    !classifySoftwareProduct({ name: 'Prompt-Engineering-Guide', description: 'Guides, papers, and lecture notes for prompt engineering', homepage: 'https://www.promptingguide.ai/' }).is_product,
+    'Excludes GitHub educational guide repositories'
+  );
+  assert(
+    !classifySoftwareProduct({ name: 'Front-End-Checklist', description: 'Exhaustive checklist for modern websites', homepage: 'https://frontendchecklist.io' }).is_product,
+    'Excludes GitHub checklist repositories'
+  );
+  assert(
+    !classifySoftwareProduct({ name: 'langflow', description: 'Visual tool for building AI workflows', homepage: 'http://www.langflow.org' }).is_product,
+    'Blocks GitHub repos with insecure non-HTTPS homepage URL'
+  );
+  assert(
+    classifySoftwareProduct({ name: 'firecrawl', description: 'Web crawler and scraping platform for LLM applications', homepage: 'https://firecrawl.dev', topics: ['llm', 'automation'] }).is_product,
+    'Accepts genuine GitHub AI application with HTTPS official site (Firecrawl)'
+  );
+
+  // -------------------------------------------------------------
+  // Test 15: URL Reachability Security Gate, Safe Slug & Category Linking
+  // -------------------------------------------------------------
+  console.log('\n--- Test Suite 15: URL Security, Safe Slug & Category Linking ---');
+  const unsafeReachability = await verifyLiveWebsiteReachability('http://example.com');
+  assert(!unsafeReachability.ok, 'verifyLiveWebsiteReachability rejects plain HTTP URLs before network call');
+
+  const ssrfReachability = await verifyLiveWebsiteReachability('https://127.0.0.1/test');
+  assert(!ssrfReachability.ok, 'verifyLiveWebsiteReachability blocks loopback SSRF URLs');
+
+  const mockCategories = [
+    { id: 'cat-coding', name: 'Coding & Development', slug: 'coding-development' },
+    { id: 'cat-image', name: 'Image & Design', slug: 'image-design' }
+  ];
+  assert(resolveCategoryId('Coding & Development', mockCategories) === 'cat-coding', 'Resolves exact category ID match');
+  assert(resolveCategoryId('image-design', mockCategories) === 'cat-image', 'Resolves category ID by slug');
+  assert(resolveCategoryId('Unknown Category XYZ', mockCategories) === null, 'Returns null when no matching category exists');
+
+  const existingWithApp = [
+    {
+      slug: 'chat-builder',
+      website_url: 'https://huggingface.co/spaces/alice/chat-builder',
+      normalized_domain: 'huggingface.co'
+    }
+  ];
+  const disambiguatedSlug = resolveSafeUniqueSlug(
+    'Chat Builder',
+    'https://huggingface.co/spaces/bob/chat-builder',
+    existingWithApp
+  );
+  assert(
+    disambiguatedSlug !== 'chat-builder' && disambiguatedSlug.startsWith('chat-builder-'),
+    `Disambiguates shared-platform slug collision safely (${disambiguatedSlug})`
+  );
 
   console.log('\n===============================================================');
   console.log(`🎉 ALL ${passedTests}/${totalTests} TESTS PASSED WITH 100% SUCCESS!`);

@@ -13,7 +13,7 @@ import {
 } from '../types/database';
 import { INITIAL_CATEGORIES, INITIAL_TOOLS } from '../data/initialData';
 import { normalizeDomain, generateSlug, ToolImportRowSchema } from '../lib/validation';
-import { getSupabase, isSupabaseConfigured } from '../lib/supabase';
+import { getSupabase, getSupabaseConfigDetails, isSupabaseConfigured } from '../lib/supabase';
 
 const STORAGE_KEYS = {
   TOOLS: 'ai_dir_tools_v1',
@@ -33,6 +33,23 @@ export interface FetchPublishedToolsResult {
   fromCache: boolean;
   cacheTimestamp?: string;
   error?: string;
+}
+
+export interface AdminToolsDiagnostics {
+  source: 'supabase';
+  supabaseUrl: string;
+  supabaseHost: string;
+  configSource: 'localStorage' | 'env' | 'none';
+  fetchedAt: string;
+  totalFetched: number;
+  publishedCount: number;
+  draftCount: number;
+  pendingCount: number;
+  unverifiedCount: number;
+  verifiedCount: number;
+  categoriesFetched: number;
+  toolCategoriesLinksFetched: number;
+  warnings: string[];
 }
 
 class DirectoryStorageService {
@@ -607,10 +624,14 @@ class DirectoryStorageService {
 
   /**
    * Fetch ALL tools from Supabase (including published, draft, pending, rejected)
-   * Enforced via Supabase RLS ('Admins manage tools' policy).
+   * along with connection and count diagnostics. Never falls back to INITIAL_TOOLS or localStorage.
    */
-  public async fetchAdminTools(): Promise<Tool[]> {
+  public async fetchAdminToolsWithDiagnostics(): Promise<{
+    tools: Tool[];
+    diagnostics: AdminToolsDiagnostics;
+  }> {
     const client = getSupabase();
+    const configDetails = getSupabaseConfigDetails();
     if (!client || !isSupabaseConfigured()) {
       throw new Error('Supabase is not configured. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
     }
@@ -620,20 +641,26 @@ class DirectoryStorageService {
       .select('*')
       .order('created_at', { ascending: false });
 
-    if (toolsError) throw toolsError;
+    if (toolsError) {
+      throw new Error(`Supabase tools query failed (${toolsError.code || 'ERROR'}): ${toolsError.message}`);
+    }
 
     const { data: categoriesData, error: catError } = await client
       .from('categories')
       .select('*')
       .order('display_order', { ascending: true });
 
-    if (catError) throw catError;
+    if (catError) {
+      throw new Error(`Supabase categories query failed (${catError.code || 'ERROR'}): ${catError.message}`);
+    }
 
     const rawTools = toolsData || [];
     const rawCategories: Category[] = categoriesData || [];
     const toolIds = rawTools.map((t: any) => t.id);
+    const warnings: string[] = [];
 
     const toolCategoriesMap: Record<string, string[]> = {};
+    let toolCategoriesLinksFetched = 0;
     if (toolIds.length > 0) {
       const { data: tcData, error: tcError } = await client
         .from('tool_categories')
@@ -641,8 +668,9 @@ class DirectoryStorageService {
         .in('tool_id', toolIds);
 
       if (tcError) {
-        console.warn('Failed to fetch tool_categories from Supabase:', tcError);
+        warnings.push(`tool_categories query failed (${tcError.code || 'ERROR'}): ${tcError.message}`);
       } else if (tcData) {
+        toolCategoriesLinksFetched = tcData.length;
         tcData.forEach((tc: any) => {
           if (!toolCategoriesMap[tc.tool_id]) toolCategoriesMap[tc.tool_id] = [];
           toolCategoriesMap[tc.tool_id].push(tc.category_id);
@@ -681,7 +709,7 @@ class DirectoryStorageService {
         sponsored_until: row.sponsored_until,
         upvotes: Number(row.upvotes) || 0,
         views_count: Number(row.views_count) || 0,
-        categories: toolCats.length > 0 ? toolCats : (rawCategories.slice(0, 1) || []),
+        categories: toolCats,
         last_verified_at: row.last_verified_at,
         created_at: row.created_at,
         updated_at: row.updated_at
@@ -692,167 +720,174 @@ class DirectoryStorageService {
     if (rawCategories.length > 0) {
       this.categories = rawCategories;
     }
-    this.saveTools();
-    return mappedTools;
+
+    const diagnostics: AdminToolsDiagnostics = {
+      source: 'supabase',
+      supabaseUrl: configDetails.url,
+      supabaseHost: configDetails.host,
+      configSource: configDetails.source,
+      fetchedAt: new Date().toISOString(),
+      totalFetched: mappedTools.length,
+      publishedCount: mappedTools.filter(t => t.publication_status === 'published').length,
+      draftCount: mappedTools.filter(t => t.publication_status === 'draft').length,
+      pendingCount: mappedTools.filter(t => t.publication_status === 'pending').length,
+      unverifiedCount: mappedTools.filter(t => t.verification_status === 'unverified').length,
+      verifiedCount: mappedTools.filter(t => t.verification_status === 'verified').length,
+      categoriesFetched: rawCategories.length,
+      toolCategoriesLinksFetched,
+      warnings
+    };
+
+    return { tools: mappedTools, diagnostics };
+  }
+
+  public async fetchAdminTools(): Promise<Tool[]> {
+    const { tools } = await this.fetchAdminToolsWithDiagnostics();
+    return tools;
   }
 
   /**
-   * Fetch all submissions from public.submissions via Supabase RLS
+   * Fetch all submissions from public.submissions via Supabase RLS (never falls back to localStorage)
    */
   public async fetchAdminSubmissions(): Promise<Submission[]> {
     const client = getSupabase();
     if (!client || !isSupabaseConfigured()) {
-      return [...this.submissions];
+      throw new Error('Supabase is not configured. Cannot load submissions.');
     }
 
-    try {
-      const { data, error } = await client
-        .from('submissions')
-        .select('*')
-        .order('created_at', { ascending: false });
+    const { data, error } = await client
+      .from('submissions')
+      .select('*')
+      .order('created_at', { ascending: false });
 
-      if (error) throw error;
-
-      const mapped: Submission[] = (data || []).map((row: any) => ({
-        id: row.id,
-        tool_name: row.tool_name,
-        website_url: row.website_url,
-        submitter_email: row.submitter_email,
-        description: row.description,
-        pricing_type: row.pricing_type || 'unknown',
-        source_information: row.source_information || undefined,
-        status: row.status || 'pending',
-        admin_notes: row.admin_notes || undefined,
-        created_at: row.created_at
-      }));
-
-      this.submissions = mapped;
-      this.saveSubmissions();
-      return mapped;
-    } catch (err) {
-      console.warn('Failed to fetch submissions from Supabase:', err);
-      return [...this.submissions];
+    if (error) {
+      throw new Error(`Supabase submissions query failed (${error.code || 'ERROR'}): ${error.message}`);
     }
+
+    const mapped: Submission[] = (data || []).map((row: any) => ({
+      id: row.id,
+      tool_name: row.tool_name,
+      website_url: row.website_url,
+      submitter_email: row.submitter_email,
+      description: row.description,
+      pricing_type: row.pricing_type || 'unknown',
+      source_information: row.source_information || undefined,
+      status: row.status || 'pending',
+      admin_notes: row.admin_notes || undefined,
+      created_at: row.created_at
+    }));
+
+    this.submissions = mapped;
+    return mapped;
   }
 
   /**
-   * Fetch categories from public.categories
+   * Fetch categories from public.categories (never falls back to INITIAL_CATEGORIES)
    */
-  public async fetchAdminCategories(): Promise<Category[]> {
+  public async fetchAdminCategories(toolsForCount?: Tool[]): Promise<Category[]> {
     const client = getSupabase();
     if (!client || !isSupabaseConfigured()) {
-      return this.getCategories();
+      throw new Error('Supabase is not configured. Cannot load categories.');
     }
 
-    try {
-      const { data, error } = await client
-        .from('categories')
-        .select('*')
-        .order('display_order', { ascending: true });
+    const { data, error } = await client
+      .from('categories')
+      .select('*')
+      .order('display_order', { ascending: true });
 
-      if (error) throw error;
-
-      const mapped: Category[] = (data || []).map((row: any) => ({
-        id: row.id,
-        name: row.name,
-        slug: row.slug,
-        description: row.description || '',
-        icon_name: row.icon_name || 'Sparkles',
-        display_order: row.display_order ?? 0,
-        tool_count: this.tools.filter(t => t.categories.some(c => c.id === row.id || c.slug === row.slug)).length,
-        created_at: row.created_at,
-        updated_at: row.updated_at
-      }));
-
-      this.categories = mapped;
-      this.saveCategories();
-      return mapped;
-    } catch (err) {
-      console.warn('Failed to fetch categories from Supabase:', err);
-      return this.getCategories();
+    if (error) {
+      throw new Error(`Supabase categories query failed (${error.code || 'ERROR'}): ${error.message}`);
     }
+
+    const countSource = toolsForCount ?? this.tools;
+    const mapped: Category[] = (data || []).map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      slug: row.slug,
+      description: row.description || '',
+      icon_name: row.icon_name || 'Sparkles',
+      display_order: row.display_order ?? 0,
+      tool_count: countSource.filter(t => t.categories.some(c => c.id === row.id || c.slug === row.slug)).length,
+      created_at: row.created_at,
+      updated_at: row.updated_at
+    }));
+
+    this.categories = mapped;
+    return mapped;
   }
 
   /**
-   * Fetch audit logs from public.audit_logs
+   * Fetch audit logs from public.audit_logs (never falls back to localStorage)
    */
   public async fetchAdminAuditLogs(): Promise<AuditLog[]> {
     const client = getSupabase();
     if (!client || !isSupabaseConfigured()) {
-      return [...this.auditLogs];
+      throw new Error('Supabase is not configured. Cannot load audit logs.');
     }
 
-    try {
-      const { data, error } = await client
-        .from('audit_logs')
-        .select('*')
-        .order('timestamp', { ascending: false })
-        .limit(100);
+    const { data, error } = await client
+      .from('audit_logs')
+      .select('*')
+      .order('timestamp', { ascending: false })
+      .limit(100);
 
-      if (error) throw error;
-
-      const mapped: AuditLog[] = (data || []).map((row: any) => ({
-        id: row.id,
-        administrator_id: row.administrator_id,
-        administrator_email: row.administrator_email || 'admin@aitoolsdirectory.internal',
-        action: row.action,
-        entity_type: row.entity_type,
-        entity_id: row.entity_id || '',
-        metadata: row.metadata || {},
-        timestamp: row.timestamp
-      }));
-
-      this.auditLogs = mapped;
-      this.saveAuditLogs();
-      return mapped;
-    } catch (err) {
-      console.warn('Failed to fetch audit logs from Supabase:', err);
-      return [...this.auditLogs];
+    if (error) {
+      throw new Error(`Supabase audit_logs query failed (${error.code || 'ERROR'}): ${error.message}`);
     }
+
+    const mapped: AuditLog[] = (data || []).map((row: any) => ({
+      id: row.id,
+      administrator_id: row.administrator_id,
+      administrator_email: row.administrator_email || 'admin@aitoolsdirectory.internal',
+      action: row.action,
+      entity_type: row.entity_type,
+      entity_id: row.entity_id || '',
+      metadata: row.metadata || {},
+      timestamp: row.timestamp
+    }));
+
+    this.auditLogs = mapped;
+    return mapped;
   }
 
   /**
-   * Fetch import batches from public.import_batches
+   * Fetch import batches from public.import_batches (never falls back to localStorage)
    */
   public async fetchAdminBatches(): Promise<ImportBatch[]> {
     const client = getSupabase();
     if (!client || !isSupabaseConfigured()) {
-      return [...this.importBatches];
+      throw new Error('Supabase is not configured. Cannot load import batches.');
     }
 
-    try {
-      const { data, error } = await client
-        .from('import_batches')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(50);
+    const { data, error } = await client
+      .from('import_batches')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(50);
 
-      if (error) throw error;
-
-      const mapped: ImportBatch[] = (data || []).map((row: any) => ({
-        id: row.id,
-        filename: row.filename,
-        source_name: row.source_name,
-        source_type: row.source_type,
-        total_rows: row.total_rows || 0,
-        valid_rows: row.valid_rows || 0,
-        inserted_rows: row.inserted_rows || 0,
-        updated_rows: row.updated_rows || 0,
-        duplicate_rows: row.duplicate_rows || 0,
-        rejected_rows: row.rejected_rows || 0,
-        status: row.status,
-        error_summary: row.error_summary,
-        created_at: row.created_at,
-        completed_at: row.completed_at
-      }));
-
-      this.importBatches = mapped;
-      this.saveBatches();
-      return mapped;
-    } catch (err) {
-      console.warn('Failed to fetch import batches from Supabase:', err);
-      return [...this.importBatches];
+    if (error) {
+      throw new Error(`Supabase import_batches query failed (${error.code || 'ERROR'}): ${error.message}`);
     }
+
+    const mapped: ImportBatch[] = (data || []).map((row: any) => ({
+      id: row.id,
+      filename: row.filename,
+      source_name: row.source_name,
+      source_type: row.source_type,
+      total_rows: row.total_rows || 0,
+      valid_rows: row.valid_rows || 0,
+      inserted_rows: row.inserted_rows || 0,
+      updated_rows: row.updated_rows || 0,
+      duplicate_rows: row.duplicate_rows || 0,
+      rejected_rows: row.rejected_rows || 0,
+      status: row.status,
+      error_summary: row.error_summary,
+      created_at: row.created_at,
+      completed_at: row.completed_at
+    }));
+
+    this.importBatches = mapped;
+    return mapped;
   }
 
   /**
@@ -1871,27 +1906,24 @@ class DirectoryStorageService {
 
   /**
    * Fetch rejected rows/errors for a batch from public.import_errors via Supabase RLS
-   * with fallback to local storage
    */
   public async fetchAdminImportErrors(batchId: string): Promise<ImportError[]> {
     const client = getSupabase();
-    if (client && isSupabaseConfigured()) {
-      try {
-        const { data, error } = await client
-          .from('import_errors')
-          .select('*')
-          .eq('batch_id', batchId)
-          .order('row_number', { ascending: true });
-
-        if (error) throw error;
-        if (data && data.length > 0) {
-          return data as ImportError[];
-        }
-      } catch (err) {
-        console.warn('Failed to fetch import errors from Supabase, falling back to local:', err);
-      }
+    if (!client || !isSupabaseConfigured()) {
+      throw new Error('Supabase is not configured. Cannot load import errors.');
     }
-    return this.getImportErrors(batchId);
+
+    const { data, error } = await client
+      .from('import_errors')
+      .select('*')
+      .eq('batch_id', batchId)
+      .order('row_number', { ascending: true });
+
+    if (error) {
+      throw new Error(`Supabase import_errors query failed (${error.code || 'ERROR'}): ${error.message}`);
+    }
+
+    return (data || []) as ImportError[];
   }
 
   // Bookmarking & Compare features

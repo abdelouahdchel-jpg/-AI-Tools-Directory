@@ -49,8 +49,7 @@ import {
   VerificationStatus,
   PricingType
 } from '../types/database';
-import { INITIAL_CATEGORIES, INITIAL_TOOLS } from '../data/initialData';
-import { directoryStorage } from '../services/storage';
+import { directoryStorage, AdminToolsDiagnostics } from '../services/storage';
 import { normalizeDomain, generateSlug } from '../lib/validation';
 import { generateRejectedRowsCsv, triggerCsvDownload } from '../lib/csvExport';
 import { verifyToolUrl, UrlVerificationResult } from '../services/urlVerifier';
@@ -63,11 +62,14 @@ import {
   signOutAdmin,
   isSupabaseConfigured,
   getSupabaseConfig,
+  getSupabaseConfigDetails,
   saveSupabaseConfig,
   clearSupabaseConfig,
   sendPasswordReset,
   AdminProfile
 } from '../lib/supabase';
+
+const EXPECTED_SUPABASE_HOST = 'kknrunnjuohkvfcuedot.supabase.co';
 
 interface AdminDashboardProps {
   onBackToSite: () => void;
@@ -173,27 +175,65 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
   // Data Loading & Sync State
   const [isLoadingData, setIsLoadingData] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
+  const [toolsDiagnostics, setToolsDiagnostics] = useState<AdminToolsDiagnostics | null>(null);
 
   const refreshData = async () => {
     setIsLoadingData(true);
     setDataError(null);
+    const errors: string[] = [];
+
     try {
-      const [fetchedTools, fetchedCategories, fetchedSubmissions, fetchedBatches, fetchedLogs] = await Promise.all([
-        directoryStorage.fetchAdminTools(),
-        directoryStorage.fetchAdminCategories(),
+      const { tools: fetchedTools, diagnostics } = await directoryStorage.fetchAdminToolsWithDiagnostics();
+      setTools(fetchedTools);
+      setToolsDiagnostics(diagnostics);
+
+      if (diagnostics.warnings.length > 0) {
+        errors.push(...diagnostics.warnings);
+      }
+
+      const [catRes, subRes, batchRes, logRes] = await Promise.allSettled([
+        directoryStorage.fetchAdminCategories(fetchedTools),
         directoryStorage.fetchAdminSubmissions(),
         directoryStorage.fetchAdminBatches(),
         directoryStorage.fetchAdminAuditLogs()
       ]);
-      setTools(fetchedTools);
-      setCategories(fetchedCategories);
-      setSubmissions(fetchedSubmissions);
-      setBatches(fetchedBatches);
-      setAuditLogs(fetchedLogs);
+
+      if (catRes.status === 'fulfilled') {
+        setCategories(catRes.value);
+      } else {
+        setCategories([]);
+        errors.push(catRes.reason?.message || 'Failed to load categories from Supabase.');
+      }
+
+      if (subRes.status === 'fulfilled') {
+        setSubmissions(subRes.value);
+      } else {
+        setSubmissions([]);
+        errors.push(subRes.reason?.message || 'Failed to load submissions from Supabase.');
+      }
+
+      if (batchRes.status === 'fulfilled') {
+        setBatches(batchRes.value);
+      } else {
+        setBatches([]);
+        errors.push(batchRes.reason?.message || 'Failed to load import_batches from Supabase.');
+      }
+
+      if (logRes.status === 'fulfilled') {
+        setAuditLogs(logRes.value);
+      } else {
+        setAuditLogs([]);
+        errors.push(logRes.reason?.message || 'Failed to load audit_logs from Supabase.');
+      }
     } catch (err: any) {
-      console.error('Failed to load admin data from Supabase:', err);
-      setDataError(err.message || 'Error communicating with Supabase database.');
+      console.error('Failed to load admin tools from Supabase:', err);
+      setTools([]);
+      setToolsDiagnostics(null);
+      errors.push(err.message || 'Error communicating with Supabase public.tools.');
     } finally {
+      if (errors.length > 0) {
+        setDataError(errors.join(' | '));
+      }
       setIsLoadingData(false);
     }
   };
@@ -332,7 +372,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
   };
 
   // Save runtime Supabase credentials
-  const handleSaveConfig = (e: React.FormEvent) => {
+  const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!configUrl.trim().startsWith('http')) {
       alert('Project URL must start with https://');
@@ -342,19 +382,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
       alert('Please enter a valid Supabase Anon Public Key.');
       return;
     }
+    try {
+      await signOutAdmin();
+    } catch {
+      // ignore sign-out failure when switching projects
+    }
     saveSupabaseConfig(configUrl, configAnonKey);
+    setIsAuthenticated(false);
+    setAdminProfile(null);
+    setTools([]);
+    setToolsDiagnostics(null);
     setConfigSavedNotice(true);
     setTimeout(() => {
       setConfigSavedNotice(false);
       setShowConfigModal(false);
-    }, 1500);
+    }, 1000);
   };
 
-  // Clear runtime credentials
-  const handleClearConfig = () => {
+  // Clear runtime credentials (reverts to build-time env if present)
+  const handleClearConfig = async () => {
+    try {
+      await signOutAdmin();
+    } catch {
+      // ignore
+    }
     clearSupabaseConfig();
-    setConfigUrl('');
-    setConfigAnonKey('');
+    const fallback = getSupabaseConfig();
+    setConfigUrl(fallback.url);
+    setConfigAnonKey(fallback.anonKey);
+    setIsAuthenticated(false);
+    setAdminProfile(null);
+    setTools([]);
+    setToolsDiagnostics(null);
     setShowConfigModal(false);
   };
 
@@ -643,8 +702,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
     setIsDiscovering(true);
     setDiscoveryImportSuccess(null);
     try {
-      const comparisonTools = tools.length > 0 ? tools : INITIAL_TOOLS;
-      const result = await discoveryService.runDiscovery(selectedSourceId, comparisonTools, {
+      const result = await discoveryService.runDiscovery(selectedSourceId, tools, {
         limit: 15,
         query: discoveryQuery.trim() || undefined
       });
@@ -826,6 +884,111 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
     );
   }
 
+  const configDetails = getSupabaseConfigDetails();
+  const activeSupabaseHost = configDetails.host;
+  const isExpectedProject = activeSupabaseHost === EXPECTED_SUPABASE_HOST;
+
+  const renderConfigModal = () =>
+    showConfigModal ? (
+      <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Database className="w-5 h-5 text-indigo-400" />
+              <h3 className="text-sm font-bold text-white">Supabase Connection Settings</h3>
+            </div>
+            <button
+              onClick={() => setShowConfigModal(false)}
+              className="text-xs text-slate-400 hover:text-white cursor-pointer px-2 py-1"
+            >
+              ✕
+            </button>
+          </div>
+
+          <p className="text-xs text-slate-400 mb-3 leading-relaxed">
+            Active connection source:{' '}
+            <span className="font-mono text-indigo-300">
+              {configDetails.source === 'localStorage'
+                ? 'Browser Override (localStorage)'
+                : configDetails.source === 'env'
+                ? 'Build Environment (VITE_SUPABASE_URL)'
+                : 'Not configured'}
+            </span>
+            {configDetails.envUrl && (
+              <>
+                <br />
+                Build-time <code className="text-slate-300">VITE_SUPABASE_URL</code>:{' '}
+                <code className="text-amber-300 font-mono">{configDetails.envUrl}</code>
+              </>
+            )}
+          </p>
+
+          {configSavedNotice && (
+            <div className="p-3 mb-4 bg-emerald-950/70 border border-emerald-800 text-emerald-300 text-xs rounded-xl flex items-center gap-2">
+              <Check className="w-4 h-4 text-emerald-400" />
+              <span>Configuration saved. Please sign in to the selected Supabase project.</span>
+            </div>
+          )}
+
+          <form onSubmit={handleSaveConfig} className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                Supabase Project URL
+              </label>
+              <input
+                type="url"
+                required
+                placeholder={`https://${EXPECTED_SUPABASE_HOST}`}
+                value={configUrl}
+                onChange={e => setConfigUrl(e.target.value)}
+                className="w-full px-3 py-2 text-xs text-white bg-slate-950 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                Supabase Anon Public Key
+              </label>
+              <textarea
+                required
+                rows={3}
+                placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                value={configAnonKey}
+                onChange={e => setConfigAnonKey(e.target.value)}
+                className="w-full px-3 py-2 text-xs text-white bg-slate-950 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono resize-none"
+              />
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                onClick={handleClearConfig}
+                className="text-xs text-rose-400 hover:text-rose-300 cursor-pointer"
+              >
+                Clear Browser Override
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowConfigModal(false)}
+                  className="px-3 py-1.5 text-xs text-slate-400 hover:text-white cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors cursor-pointer"
+                >
+                  Save &amp; Connect
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    ) : null;
+
   // If not logged in, render secure Supabase Auth login portal
   if (!isAuthenticated) {
     const isConfigured = isSupabaseConfigured();
@@ -841,7 +1004,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
               </div>
               <div>
                 <h1 className="text-base font-bold text-white tracking-tight">Admin Operations Console</h1>
-                <p className="text-[11px] text-slate-400">PostgreSQL RLS & Supabase Auth</p>
+                <p className="text-[11px] text-slate-400">PostgreSQL RLS &amp; Supabase Auth</p>
               </div>
             </div>
 
@@ -849,14 +1012,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
             <button
               onClick={() => setShowConfigModal(true)}
               className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border transition-colors cursor-pointer ${
-                isConfigured
+                isConfigured && isExpectedProject
                   ? 'bg-emerald-950/60 border-emerald-800 text-emerald-400 hover:bg-emerald-900/60'
                   : 'bg-amber-950/60 border-amber-800 text-amber-400 hover:bg-amber-900/60'
               }`}
-              title="Click to view or edit Supabase configuration"
+              title={activeSupabaseHost ? `Connected: ${activeSupabaseHost} (${configDetails.source})` : 'Click to view or edit Supabase configuration'}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-              <span>{isConfigured ? 'Supabase Connected' : 'Config Required'}</span>
+              <span className={`w-1.5 h-1.5 rounded-full ${isConfigured && isExpectedProject ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+              <span className="max-w-[140px] truncate">{isConfigured ? (activeSupabaseHost || 'Connected') : 'Config Required'}</span>
             </button>
           </div>
 
@@ -871,6 +1034,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
               <div className="flex-1">
                 <span className="font-semibold block mb-0.5 text-amber-200">Supabase Connection Required</span>
                 Supabase credentials are not detected. Administrator login requires a valid Supabase project. Click &quot;Configure Supabase&quot; below to set your project credentials.
+              </div>
+            </div>
+          )}
+
+          {/* Project Mismatch Banner on Login */}
+          {isConfigured && !isExpectedProject && (
+            <div className="p-3.5 mb-5 bg-amber-950/70 border border-amber-800/80 text-amber-200 text-xs rounded-xl flex items-start gap-2.5 leading-relaxed">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <span className="font-semibold block mb-0.5">Wrong Supabase Project Connected</span>
+                Connected to <code className="font-mono text-amber-300">{activeSupabaseHost}</code> ({configDetails.source}), instead of <code className="font-mono text-emerald-300">{EXPECTED_SUPABASE_HOST}</code>.
               </div>
             </div>
           )}
@@ -993,92 +1167,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
           </div>
         </div>
 
-        {/* Supabase Configuration Modal */}
-        {showConfigModal && (
-          <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-            <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <Database className="w-5 h-5 text-indigo-400" />
-                  <h3 className="text-sm font-bold text-white">Supabase Connection Settings</h3>
-                </div>
-                <button
-                  onClick={() => setShowConfigModal(false)}
-                  className="text-xs text-slate-400 hover:text-white cursor-pointer px-2 py-1"
-                >
-                  ✕
-                </button>
-              </div>
-
-              <p className="text-xs text-slate-400 mb-4 leading-relaxed">
-                Connect your Supabase project credentials. These are used client-side for Supabase Auth and directory queries. You can also define them in <code className="text-indigo-300">.env</code> as <code className="text-indigo-300">VITE_SUPABASE_URL</code> and <code className="text-indigo-300">VITE_SUPABASE_ANON_KEY</code>.
-              </p>
-
-              {configSavedNotice && (
-                <div className="p-3 mb-4 bg-emerald-950/70 border border-emerald-800 text-emerald-300 text-xs rounded-xl flex items-center gap-2">
-                  <Check className="w-4 h-4 text-emerald-400" />
-                  <span>Configuration saved successfully! Reloading...</span>
-                </div>
-              )}
-
-              <form onSubmit={handleSaveConfig} className="space-y-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-300 mb-1">
-                    Supabase Project URL
-                  </label>
-                  <input
-                    type="url"
-                    required
-                    placeholder="https://xyzcompany.supabase.co"
-                    value={configUrl}
-                    onChange={e => setConfigUrl(e.target.value)}
-                    className="w-full px-3 py-2 text-xs text-white bg-slate-950 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-300 mb-1">
-                    Supabase Anon Public Key
-                  </label>
-                  <textarea
-                    required
-                    rows={3}
-                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-                    value={configAnonKey}
-                    onChange={e => setConfigAnonKey(e.target.value)}
-                    className="w-full px-3 py-2 text-xs text-white bg-slate-950 border border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono resize-none"
-                  />
-                </div>
-
-                <div className="flex items-center justify-between pt-2">
-                  <button
-                    type="button"
-                    onClick={handleClearConfig}
-                    className="text-xs text-rose-400 hover:text-rose-300 cursor-pointer"
-                  >
-                    Clear Credentials
-                  </button>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setShowConfigModal(false)}
-                      className="px-3 py-1.5 text-xs text-slate-400 hover:text-white cursor-pointer"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="submit"
-                      className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg transition-colors cursor-pointer"
-                    >
-                      Save & Connect
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </div>
-          </div>
-        )}
+        {renderConfigModal()}
       </div>
     );
   }
@@ -1094,14 +1183,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
   });
 
   const isConfigured = isSupabaseConfigured();
-  const activeSupabaseHost = (() => {
-    try {
-      const cfgUrl = getSupabaseConfig().url;
-      return cfgUrl ? new URL(cfgUrl).hostname : '';
-    } catch {
-      return '';
-    }
-  })();
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col">
@@ -1148,13 +1229,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
             <button
               onClick={() => setShowConfigModal(true)}
               className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono border transition-colors cursor-pointer ${
-                isConfigured
+                isConfigured && isExpectedProject
                   ? 'bg-emerald-950/60 border-emerald-800 text-emerald-400 hover:bg-emerald-900/60'
-                  : 'bg-amber-950/60 border-amber-800 text-amber-400 hover:bg-amber-900/60'
+                  : 'bg-rose-950/70 border-rose-700 text-rose-300 hover:bg-rose-900/70'
               }`}
-              title={activeSupabaseHost ? `Connected Supabase project: ${activeSupabaseHost}` : 'Click to view or edit Supabase configuration'}
+              title={activeSupabaseHost ? `Connected Supabase project: ${activeSupabaseHost} (${configDetails.source})` : 'Click to view or edit Supabase configuration'}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${isConfigured ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+              <span className={`w-1.5 h-1.5 rounded-full ${isConfigured && isExpectedProject ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
               <span>{isConfigured ? (activeSupabaseHost || 'Supabase Auth') : 'Config Required'}</span>
             </button>
 
@@ -1241,14 +1322,82 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
 
       {/* Main Viewport Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1 w-full">
+        {/* Project Mismatch Warning if connected to wrong Supabase project */}
+        {!isExpectedProject && (
+          <div className="mb-6 p-4 bg-amber-50 border border-amber-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-950 shadow-xs">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold text-xs block mb-0.5">
+                  Supabase Project Mismatch Detected
+                </span>
+                <p className="text-xs text-amber-800 leading-relaxed">
+                  Connected to <code className="font-mono font-semibold bg-amber-100 px-1 rounded">{activeSupabaseHost || 'none'}</code> (via {configDetails.source}), instead of <code className="font-mono font-semibold bg-amber-100 px-1 rounded">{EXPECTED_SUPABASE_HOST}</code>. Update <code className="font-mono">VITE_SUPABASE_URL</code> &amp; <code className="font-mono">VITE_SUPABASE_ANON_KEY</code> in Vercel Environment Variables or switch connection below.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowConfigModal(true)}
+              className="px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition-colors shrink-0 cursor-pointer"
+            >
+              Switch Project
+            </button>
+          </div>
+        )}
+
+        {/* Supabase Diagnostics Strip (Connection Source + Retrieved Counts) */}
+        <div className="mb-6 p-3.5 bg-white border border-slate-200 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs shadow-2xs">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            <div className="flex items-center gap-1.5">
+              <Database className="w-3.5 h-3.5 text-indigo-600" />
+              <span className="font-semibold text-slate-700">Source:</span>
+              <code className="font-mono text-[11px] bg-slate-100 px-1.5 py-0.5 rounded text-slate-900">
+                {activeSupabaseHost || 'unconfigured'}
+              </code>
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+                {configDetails.source === 'localStorage' ? 'Browser Override' : configDetails.source === 'env' ? 'Build Env (VITE_)' : 'None'}
+              </span>
+            </div>
+
+            {toolsDiagnostics ? (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-slate-600">
+                <span>
+                  fetchAdminTools(): <strong className="text-slate-900">{toolsDiagnostics.totalFetched}</strong> rows
+                </span>
+                <span>·</span>
+                <span className="text-emerald-700">Published: {toolsDiagnostics.publishedCount}</span>
+                <span>·</span>
+                <span className="text-slate-800 font-semibold">Draft: {toolsDiagnostics.draftCount}</span>
+                <span>·</span>
+                <span className="text-amber-700">Unverified: {toolsDiagnostics.unverifiedCount}</span>
+                <span>·</span>
+                <span className="text-slate-400">
+                  Synced {new Date(toolsDiagnostics.fetchedAt).toLocaleTimeString()}
+                </span>
+              </div>
+            ) : (
+              <span className="text-[11px] text-slate-500 font-mono">
+                {isLoadingData ? 'Querying Supabase public.tools...' : 'No live tool records loaded'}
+              </span>
+            )}
+          </div>
+
+          {toolsDiagnostics && toolsDiagnostics.totalFetched > 0 && toolsDiagnostics.draftCount === 0 && isExpectedProject && (
+            <span className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-md">
+              0 draft rows returned by Supabase RLS — verify <code className="font-mono">public.admin_users.is_active = true</code> for <code className="font-mono">{adminProfile?.email}</code>
+            </span>
+          )}
+        </div>
+
         {/* Error notification banner if Supabase communication fails */}
         {dataError && (
           <div className="mb-6 p-4 bg-rose-50 border border-rose-200 rounded-xl flex items-start justify-between gap-3 text-rose-800 shadow-xs">
             <div className="flex items-start gap-2.5">
               <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
               <div>
-                <span className="font-semibold text-xs block mb-0.5">Database Query Warning</span>
-                <p className="text-xs text-rose-700 leading-relaxed">{dataError}</p>
+                <span className="font-semibold text-xs block mb-0.5">Supabase Database Error</span>
+                <p className="text-xs text-rose-700 leading-relaxed font-mono">{dataError}</p>
               </div>
             </div>
             <button
@@ -1421,7 +1570,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
                     sponsored: false,
                     upvotes: 0,
                     views_count: 0,
-                    categories: [categories[0] || INITIAL_CATEGORIES[0]],
+                    categories: categories.length > 0 ? [categories[0]] : [],
                     created_at: new Date().toISOString(),
                     updated_at: new Date().toISOString()
                   });
@@ -1474,7 +1623,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
                           </div>
                         </td>
                         <td className="py-2.5 px-3 text-slate-600">
-                          {t.categories.map(c => c.name).join(', ')}
+                          {t.categories.length > 0 ? (
+                            t.categories.map(c => c.name).join(', ')
+                          ) : (
+                            <span className="text-slate-400 italic">Uncategorized</span>
+                          )}
                         </td>
                         <td className="py-2.5 px-3 font-mono capitalize">
                           {t.pricing_type}
@@ -3099,6 +3252,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBackToSite, on
           </div>
         </div>
       )}
+
+      {renderConfigModal()}
     </div>
   );
 };

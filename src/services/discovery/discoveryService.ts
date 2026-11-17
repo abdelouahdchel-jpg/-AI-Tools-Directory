@@ -5,6 +5,7 @@ import { HuggingFaceSpacesAdapter } from './huggingFaceAdapter';
 import { PublicRssFeedAdapter } from './rssAdapter';
 import { ToolImportRowSchema, normalizeDomain, generateSlug } from '../../lib/validation';
 import { Tool } from '../../types/database';
+import { preflightCheckUrl } from '../urlVerifier';
 
 /**
  * Normalizes a URL for robust deduplication comparison
@@ -204,8 +205,14 @@ export class DiscoveryService {
         });
       }
 
-      // 3. Schema validation check against ToolImportRowSchema
+      // 3. Schema & URL Security validation check
       const validationErrors: string[] = [];
+      const urlSecurity = preflightCheckUrl(candidate.website_url);
+      if (!urlSecurity.safe) {
+        validationErrors.push(`website_url: ${urlSecurity.error || 'Unsafe or non-HTTPS URL blocked'}`);
+        candidate.website_check_result = `Blocked URL security check: ${urlSecurity.error || 'HTTPS required'}`;
+      }
+
       const parsed = ToolImportRowSchema.safeParse({
         name: candidate.name,
         website_url: candidate.website_url,
@@ -227,7 +234,9 @@ export class DiscoveryService {
         parsed.error.issues.forEach(issue => {
           validationErrors.push(`${issue.path.join('.')}: ${issue.message}`);
         });
-      } else {
+      }
+
+      if (validationErrors.length === 0) {
         validCount++;
       }
 
@@ -239,6 +248,8 @@ export class DiscoveryService {
         evaluationStatus = 'Duplicate';
       } else if (validationErrors.length > 0) {
         evaluationStatus = 'Needs Correction';
+      } else if (candidate.confidence_score < 0.75) {
+        evaluationStatus = 'Needs Manual Review';
       }
 
       // Candidate updated with final evaluation status

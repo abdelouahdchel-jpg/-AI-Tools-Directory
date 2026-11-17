@@ -20,17 +20,70 @@ export interface AuthAdminSession {
   adminProfile: AdminProfile;
 }
 
-// Retrieve configured URL and Key from environment or local storage
+export interface SupabaseConfigDetails {
+  url: string;
+  anonKey: string;
+  host: string;
+  source: 'localStorage' | 'env' | 'none';
+  envUrl: string;
+  hasEnvConfig: boolean;
+  hasLocalOverride: boolean;
+}
+
+// Retrieve configured URL and Key from runtime localStorage override or build-time environment
+export function getSupabaseConfigDetails(): SupabaseConfigDetails {
+  const envUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
+  const envKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+
+  const storedUrl = typeof window !== 'undefined' ? (localStorage.getItem(STORAGE_SUPABASE_URL) || '').trim() : '';
+  const storedKey = typeof window !== 'undefined' ? (localStorage.getItem(STORAGE_SUPABASE_ANON_KEY) || '').trim() : '';
+
+  const hasEnvUrl = Boolean(envUrl && !envUrl.includes('your-project.supabase.co') && envUrl.startsWith('http'));
+  const hasEnvKey = Boolean(envKey && !envKey.includes('your-anon-public-key') && envKey.length > 20);
+  const hasEnvConfig = hasEnvUrl && hasEnvKey;
+
+  const hasLocalOverride = Boolean(
+    storedUrl &&
+    storedKey &&
+    storedUrl.startsWith('http') &&
+    storedKey.length > 20
+  );
+
+  let url = '';
+  let anonKey = '';
+  let source: 'localStorage' | 'env' | 'none' = 'none';
+
+  if (hasLocalOverride) {
+    url = storedUrl;
+    anonKey = storedKey;
+    source = 'localStorage';
+  } else if (hasEnvConfig) {
+    url = envUrl;
+    anonKey = envKey;
+    source = 'env';
+  }
+
+  let host = '';
+  try {
+    host = url ? new URL(url).hostname : '';
+  } catch {
+    host = '';
+  }
+
+  return {
+    url,
+    anonKey,
+    host,
+    source,
+    envUrl: hasEnvUrl ? envUrl : '',
+    hasEnvConfig,
+    hasLocalOverride
+  };
+}
+
+// Retrieve active URL and Key
 export function getSupabaseConfig(): { url: string; anonKey: string } {
-  const envUrl = import.meta.env.VITE_SUPABASE_URL || '';
-  const envKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
-
-  const storedUrl = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_SUPABASE_URL) || '' : '';
-  const storedKey = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_SUPABASE_ANON_KEY) || '' : '';
-
-  const url = (envUrl && !envUrl.includes('your-project.supabase.co')) ? envUrl : storedUrl;
-  const anonKey = (envKey && !envKey.includes('your-anon-public-key')) ? envKey : storedKey;
-
+  const { url, anonKey } = getSupabaseConfigDetails();
   return { url, anonKey };
 }
 

@@ -48,7 +48,7 @@ export interface DiscoverySourceMetadata {
 
 export interface SourceAdapter {
   metadata: DiscoverySourceMetadata;
-  discover(options?: { limit?: number; query?: string }): Promise<DiscoveredToolCandidate[]>;
+  discover(options?: { limit?: number; query?: string; excludeUrls?: Set<string> }): Promise<DiscoveredToolCandidate[]>;
 }
 
 export interface DiscoveryBatchResult {
